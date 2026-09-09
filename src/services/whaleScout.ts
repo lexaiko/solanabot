@@ -10,7 +10,9 @@ import {
   getWhalesForPruning,
   addToWhaleQueue,
   getWhaleQueue,
-  promoteQueueWhaleToActive 
+  promoteQueueWhaleToActive,
+  isWhaleBlacklisted,
+  blacklistWhale 
 } from '../db/index';
 import { refreshWhaleSubscriptions } from './tracker';
 import { getTokenMarketData } from './dexscreener';
@@ -237,7 +239,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           const firstAccount = tx.transaction.message.accountKeys[0];
           const feePayerKey = firstAccount?.pubkey ? firstAccount.pubkey.toBase58() : null;
 
-          if (!feePayerKey || SYSTEM_BLACKLIST.has(feePayerKey)) continue;
+          if (!feePayerKey || SYSTEM_BLACKLIST.has(feePayerKey) || isWhaleBlacklisted(feePayerKey)) continue;
 
           // Check if wallet is already registered in active roster
           if (getWhaleByAddress(feePayerKey)) continue;
@@ -453,7 +455,7 @@ export async function pruneUnderperformingWhales(): Promise<number> {
       const balanceSol = lamports / 1_000_000_000;
 
       if (balanceSol < 0.2) {
-        const removed = removeWhale(whale.id);
+        const removed = removeWhale(whale.id, 'Saldo Habis / Dompet Ditinggalkan (< 0.2 SOL)');
         if (removed) {
           prunedCount++;
           console.log(`[WhalePruner] 🗑️ AUTO-ELIMINASI (SALDO KOSONG): ${whale.label} (${whale.address}) Saldo: ${balanceSol.toFixed(3)} SOL`);
@@ -487,7 +489,7 @@ export async function pruneUnderperformingWhales(): Promise<number> {
       reason = `Tidak Aktif (> ${CONFIG.AUTO_PRUNE_INACTIVE_HOURS} jam tanpa transaksi)`;
     }
 
-    const removed = removeWhale(whale.id);
+    const removed = removeWhale(whale.id, reason);
     if (removed) {
       prunedCount++;
       console.log(`[WhalePruner] 🗑️ DIELIMINASI: ${whale.label} (${whale.address}) - Alasan: ${reason}`);

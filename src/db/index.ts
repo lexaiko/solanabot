@@ -90,6 +90,12 @@ export function initDatabase() {
       created_at TEXT NOT NULL,
       status TEXT DEFAULT 'WATCHING'
     );
+
+    CREATE TABLE IF NOT EXISTS whale_blacklist (
+      address TEXT PRIMARY KEY,
+      reason TEXT,
+      blacklisted_at TEXT NOT NULL
+    );
   `);
 
   // Migrations for existing DB instances
@@ -106,6 +112,7 @@ export function initDatabase() {
   try { db.exec('ALTER TABLE trade_history ADD COLUMN net_pnl_sol REAL DEFAULT 0;'); } catch {}
   try { db.exec('ALTER TABLE positions ADD COLUMN target_tp_pct REAL DEFAULT 35.0;'); } catch {}
   try { db.exec('ALTER TABLE positions ADD COLUMN target_sl_pct REAL DEFAULT 20.0;'); } catch {}
+  try { db.exec('CREATE TABLE IF NOT EXISTS whale_blacklist (address TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT NOT NULL);'); } catch {}
 
 
 
@@ -191,16 +198,68 @@ export function addWhale(
   }
 }
 
-export function removeWhale(idOrAddress: string | number): boolean {
+export function removeWhale(idOrAddress: string | number, reason?: string): boolean {
   try {
+    let addressToBlacklist: string | null = null;
+    if (reason) {
+      if (typeof idOrAddress === 'string' && isNaN(Number(idOrAddress))) {
+        addressToBlacklist = idOrAddress.trim();
+      } else {
+        const row = db.prepare('SELECT address FROM whales WHERE id = ?').get(Number(idOrAddress)) as { address: string } | undefined;
+        if (row) addressToBlacklist = row.address;
+      }
+    }
+
     if (typeof idOrAddress === 'number' || !isNaN(Number(idOrAddress))) {
       db.prepare('DELETE FROM whales WHERE id = ?').run(Number(idOrAddress));
     } else {
       db.prepare('DELETE FROM whales WHERE address = ?').run(String(idOrAddress).trim());
     }
+
+    if (addressToBlacklist && reason) {
+      blacklistWhale(addressToBlacklist, reason);
+    }
     return true;
   } catch {
     return false;
+  }
+}
+
+export function blacklistWhale(address: string, reason: string = 'Eliminasi Kinerja Buruk'): boolean {
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO whale_blacklist (address, reason, blacklisted_at)
+      VALUES (?, ?, ?)
+    `).run(address.trim(), reason.trim(), new Date().toISOString());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isWhaleBlacklisted(address: string): boolean {
+  try {
+    const row = db.prepare('SELECT address FROM whale_blacklist WHERE address = ?').get(address.trim());
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+export function unblacklistWhale(address: string): boolean {
+  try {
+    db.prepare('DELETE FROM whale_blacklist WHERE address = ?').run(address.trim());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getBlacklistedWhales(): { address: string; reason: string; blacklisted_at: string }[] {
+  try {
+    return db.prepare('SELECT * FROM whale_blacklist ORDER BY blacklisted_at DESC').all() as any[];
+  } catch {
+    return [];
   }
 }
 
@@ -221,6 +280,7 @@ export function addToWhaleQueue(candidate: {
   try {
     const existingActive = getWhaleByAddress(candidate.address);
     if (existingActive) return false;
+    if (isWhaleBlacklisted(candidate.address)) return false;
 
     db.prepare(`
       INSERT INTO whale_queue (address, label, archetype, balance_sol, reference_token, reference_pool, score, created_at)

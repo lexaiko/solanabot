@@ -22,7 +22,10 @@ import {
   removeFromWhaleQueue,
   clearWhaleQueue,
   popBestQueueWhale,
-  promoteQueueWhaleToActive
+  promoteQueueWhaleToActive,
+  blacklistWhale,
+  unblacklistWhale,
+  getBlacklistedWhales
 } from '../db/index';
 import { getSolPriceUsd, getTokenMarketData } from '../services/dexscreener';
 import { checkTokenSafety } from '../services/antirug';
@@ -143,6 +146,8 @@ bot.command('help', async (ctx) => {
     `• \`/addwhale <addr> <label>\` - Tambah dompet paus manual ke radar\n\n` +
     `🛡️ *Keamanan & Proteksi:*\n` +
     `• \`/cabal\` - Audit kluster sindikat cabal / funder dev\n` +
+    `• \`/blacklist\` - Lihat atau kelola daftar dompet yang diblokir permanen\n` +
+    `• \`/unblacklist <addr>\` - Buka blokir dompet dari blacklist\n` +
     `• \`/resetcb\` - Reset Circuit Breaker jika terpicu cooldown\n` +
     `• Paste Alamat Kontrak (CA) apapun untuk audit instan Anti-Rug & Quick Snipe!`;
 
@@ -548,6 +553,44 @@ bot.command('prune', async (ctx) => {
   } else {
     await ctx.replyWithMarkdown('✅ *Semua dompet paus berkinerja baik dan aktif!* Tidak ada yang perlu dieliminasi saat ini.');
   }
+});
+
+// COMMAND: /blacklist [address] [reason]
+bot.command('blacklist', async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length === 1) {
+    const list = getBlacklistedWhales();
+    if (list.length === 0) {
+      return ctx.replyWithMarkdown('🛡️ *DAFTAR BLACKLIST DOMPET*\n\n_Belum ada dompet paus yang masuk daftar blacklist._');
+    }
+    let text = `🛡️ *DAFTAR BLACKLIST DOMPET (${list.length})*\n_Dompet berikut diblokir permanen dari radar & tidak akan pernah direkrut ulang:_\n\n`;
+    list.slice(0, 15).forEach((b, idx) => {
+      text += `*${idx + 1}.* \`${b.address.slice(0, 6)}...${b.address.slice(-6)}\`\n• Alasan: _${b.reason}_\n• Tanggal: ${b.blacklisted_at.slice(0, 10)}\n\n`;
+    });
+    return ctx.replyWithMarkdown(text);
+  }
+
+  const address = parts[1];
+  const reason = parts.slice(2).join(' ') || 'Manual Blacklist via Telegram';
+  if (address.length < 32 || address.length > 44) {
+    return ctx.replyWithMarkdown('❌ Alamat Solana tidak valid (panjang karakter tidak sesuai).');
+  }
+
+  removeWhale(address, reason);
+  blacklistWhale(address, reason);
+  refreshWhaleSubscriptions();
+  await ctx.replyWithMarkdown(`🚫 *Dompet Resmi Dimasukkan ke Blacklist!*\n\n📝 *Alamat:* \`${address}\`\n⚠️ *Alasan:* ${reason}\n\n_Dompet ini telah dicopot dari radar aktif dan diharamkan selamanya untuk direkrut ulang._`);
+});
+
+// COMMAND: /unblacklist <address>
+bot.command('unblacklist', async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 2) {
+    return ctx.replyWithMarkdown('Format salah!\nGunakan: `/unblacklist <alamat_solana>`');
+  }
+  const address = parts[1];
+  unblacklistWhale(address);
+  await ctx.replyWithMarkdown(`✅ *Dompet Dihapus dari Blacklist!*\n\n📝 *Alamat:* \`${address}\` sekarang diizinkan kembali masuk radar.`);
 });
 
 // 4. COMMAND: /addwhale <address> <label>
