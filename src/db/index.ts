@@ -443,6 +443,13 @@ export function closeShadowWatch(id: number) {
   } catch {}
 }
 
+export function closeAllShadowWatchesForWhale(whaleAddress: string) {
+  try {
+    db.prepare("UPDATE shadow_watches SET status = 'RESOLVED' WHERE whale_address = ? AND status = 'WATCHING'").run(whaleAddress);
+  } catch {}
+}
+
+
 // Positions Functions
 export function getOpenPositions(): Position[] {
   return db.prepare("SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC").all() as unknown as Position[];

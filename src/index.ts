@@ -67,35 +67,41 @@ async function main() {
 
       // Check if this whale was in probation and had a shadow watch on this token
       try {
-        const { getActiveShadowWatch, closeShadowWatch, promoteWhale, recordWhaleTrade } = await import('./db/index');
-        const shadow = getActiveShadowWatch(whale.address, tokenMint);
-        if (shadow) {
-          const { getTokenMarketData } = await import('./services/dexscreener');
-          const market = await getTokenMarketData(tokenMint);
-          if (market && market.priceUsd > 0) {
-            const pnlPct = ((market.priceUsd - shadow.entry_price_usd) / shadow.entry_price_usd) * 100;
-            closeShadowWatch(shadow.id);
-            console.log(`[WhaleScout] 🔬 Shadow Trade Evaluated for ${whale.label}: Token ${market.symbol} PnL: ${pnlPct.toFixed(2)}%`);
+        const { getActiveShadowWatch, closeShadowWatch, closeAllShadowWatchesForWhale, promoteWhale, recordWhaleTrade } = await import('./db/index');
+        // Only evaluate and promote if the whale is currently in PROBATION
+        if (whale.tier === 'PROBATION') {
+          const shadow = getActiveShadowWatch(whale.address, tokenMint);
+          if (shadow) {
+            const { getTokenMarketData } = await import('./services/dexscreener');
+            const market = await getTokenMarketData(tokenMint);
+            if (market && market.priceUsd > 0) {
+              const pnlPct = ((market.priceUsd - shadow.entry_price_usd) / shadow.entry_price_usd) * 100;
+              closeAllShadowWatchesForWhale(whale.address);
+              console.log(`[WhaleScout] 🔬 Shadow Trade Evaluated for ${whale.label}: Token ${market.symbol} PnL: ${pnlPct.toFixed(2)}%`);
 
-            if (pnlPct > 0) {
-              promoteWhale(whale.address);
-              console.log(`[WhaleScout] 🎖️ PROMOSI: Whale ${whale.label} lolos audisi shadow mode (+${pnlPct.toFixed(1)}% profit)! Status -> VERIFIED`);
-              const promoMsg = `🎓 *KANDIDAT SMART MONEY LOLOS AUDISI SHADOW MODE!*\n\n` +
-                `Dompet *${whale.label}* (\`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`) berhasil membuktikan profitabilitas di pasar on-chain!\n` +
-                `• Token Uji Coba: *${market.symbol}*\n` +
-                `• Hasil Trade: *+${pnlPct.toFixed(1)}% PROFIT* 🟢\n` +
-                `• Status Baru: *VERIFIED (AUTO-COPY AKTIF)* 🚀\n\n` +
-                `_Mulai sekarang, bot akan otomatis menyalin setiap order beli dari paus ini._`;
-              const { bot } = await import('./bot/telegram');
-              if (CONFIG.TELEGRAM_ADMIN_ID) {
-                bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, promoMsg, { parse_mode: 'Markdown' }).catch(() => {});
+              if (pnlPct >= 2.0) {
+                promoteWhale(whale.address);
+                whale.tier = 'VERIFIED';
+                whale.auto_copy = 1;
+                console.log(`[WhaleScout] 🎖️ PROMOSI: Whale ${whale.label} lolos audisi shadow mode (+${pnlPct.toFixed(1)}% profit)! Status -> VERIFIED`);
+                const promoMsg = `🎓 *KANDIDAT SMART MONEY LOLOS AUDISI SHADOW MODE!*\n\n` +
+                  `Dompet *${whale.label}* (\`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`) berhasil membuktikan profitabilitas di pasar on-chain!\n` +
+                  `• Token Uji Coba: *${market.symbol}*\n` +
+                  `• Hasil Trade: *+${pnlPct.toFixed(1)}% PROFIT* 🟢\n` +
+                  `• Status Baru: *VERIFIED (AUTO-COPY AKTIF)* 🚀\n\n` +
+                  `_Mulai sekarang, bot akan otomatis menyalin setiap order beli dari paus ini._`;
+                const { bot } = await import('./bot/telegram');
+                if (CONFIG.TELEGRAM_ADMIN_ID) {
+                  bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, promoMsg, { parse_mode: 'Markdown' }).catch(() => {});
+                }
+              } else if (pnlPct < -10) {
+                recordWhaleTrade(whale.address, -0.01, false);
               }
-            } else if (pnlPct < -10) {
-              recordWhaleTrade(whale.address, -0.01, false);
             }
           }
         }
       } catch {}
+
 
       await executeWhaleSellFollow(whale, tokenMint, tokenAmount);
     }
