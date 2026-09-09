@@ -96,6 +96,13 @@ export function initDatabase() {
       reason TEXT,
       blacklisted_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS watchers (
+      user_id INTEGER PRIMARY KEY,
+      username TEXT,
+      first_name TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
 
   // Migrations for existing DB instances
@@ -113,6 +120,7 @@ export function initDatabase() {
   try { db.exec('ALTER TABLE positions ADD COLUMN target_tp_pct REAL DEFAULT 35.0;'); } catch {}
   try { db.exec('ALTER TABLE positions ADD COLUMN target_sl_pct REAL DEFAULT 20.0;'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS whale_blacklist (address TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT NOT NULL);'); } catch {}
+  try { db.exec('CREATE TABLE IF NOT EXISTS watchers (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL);'); } catch {}
 
 
 
@@ -258,6 +266,45 @@ export function unblacklistWhale(address: string): boolean {
 export function getBlacklistedWhales(): { address: string; reason: string; blacklisted_at: string }[] {
   try {
     return db.prepare('SELECT * FROM whale_blacklist ORDER BY blacklisted_at DESC').all() as any[];
+  } catch {
+    return [];
+  }
+}
+
+// Watcher Subscribers Functions (Read-Only Community Mode)
+export function addWatcher(userId: number, username?: string, firstName?: string): boolean {
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO watchers (user_id, username, first_name, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(userId, username || '', firstName || '', new Date().toISOString());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function removeWatcher(userId: number): boolean {
+  try {
+    db.prepare('DELETE FROM watchers WHERE user_id = ?').run(userId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isWatcher(userId: number): boolean {
+  try {
+    const row = db.prepare('SELECT user_id FROM watchers WHERE user_id = ?').get(userId);
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+export function getWatchers(): { user_id: number; username?: string; first_name?: string; created_at: string }[] {
+  try {
+    return db.prepare('SELECT * FROM watchers ORDER BY created_at ASC').all() as any[];
   } catch {
     return [];
   }

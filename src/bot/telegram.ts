@@ -25,7 +25,11 @@ import {
   promoteQueueWhaleToActive,
   blacklistWhale,
   unblacklistWhale,
-  getBlacklistedWhales
+  getBlacklistedWhales,
+  addWatcher,
+  removeWatcher,
+  isWatcher,
+  getWatchers
 } from '../db/index';
 import { getSolPriceUsd, getTokenMarketData } from '../services/dexscreener';
 import { checkTokenSafety } from '../services/antirug';
@@ -42,7 +46,7 @@ import {
 
 export const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
 
-// Register Telegram notifiers
+// Register Telegram notifiers (Admin + Active Watchers Broadcast)
 const sendAdminAlert = async (msg: string, extra?: any) => {
   if (CONFIG.TELEGRAM_ADMIN_ID) {
     try {
@@ -54,21 +58,106 @@ const sendAdminAlert = async (msg: string, extra?: any) => {
       console.error('[Telegram] Gagal kirim pesan ke admin:', err.message);
     }
   }
+
+  // Broadcast to all active Watchers
+  try {
+    const watchers = getWatchers();
+    for (const w of watchers) {
+      if (w.user_id !== CONFIG.TELEGRAM_ADMIN_ID) {
+        bot.telegram.sendMessage(w.user_id, msg, {
+          parse_mode: 'Markdown',
+          ...extra
+        }).catch((err: any) => {
+          if (err?.response?.error_code === 403) {
+            removeWatcher(w.user_id);
+          }
+        });
+      }
+    }
+  } catch {}
 };
 
 setTelegramNotifier(sendAdminAlert);
 setScoutNotifier(sendAdminAlert);
 
-// Middleware: Restrict bot usage to configured admin
+// Executive/Admin commands that modify state or settings
+const ADMIN_COMMANDS = new Set([
+  'buy', 'sell', 'settings', 'prune', 'addwhale', 'delwhale',
+  'promote', 'demote', 'blacklist', 'unblacklist', 'resetcb',
+  'popqueue', 'promotequeue', 'delqueue'
+]);
+
+// Middleware: Role-Based Access Control (Admin vs Watcher)
 bot.use(async (ctx, next) => {
-  if (CONFIG.TELEGRAM_ADMIN_ID && ctx.from?.id !== CONFIG.TELEGRAM_ADMIN_ID) {
-    return ctx.reply('⛔ Maaf, bot ini disetel khusus untuk pemilik (Admin Private Mode).');
+  const userId = ctx.from?.id;
+  const isAdmin = CONFIG.TELEGRAM_ADMIN_ID && userId === CONFIG.TELEGRAM_ADMIN_ID;
+
+  // If text command
+  const text = (ctx.message as any)?.text?.trim();
+  if (text && text.startsWith('/')) {
+    const cmd = text.slice(1).split(/[\s@]+/)[0].toLowerCase();
+    if (ADMIN_COMMANDS.has(cmd) && !isAdmin) {
+      return ctx.replyWithMarkdown('⛔ *Akses Ditolak*\nPerintah ini hanya dapat diakses oleh Administrator bot.');
+    }
   }
+
+  // If callback query is triggered, check admin-only actions
+  const cbData = (ctx.callbackQuery as any)?.data;
+  if (cbData) {
+    const adminActions = [
+      'trigger_prune', 'trigger_buy', 'trigger_sell', 'menu_settings',
+      'trigger_delwhale', 'trigger_promote', 'trigger_demote', 'reset_paper_balance',
+      'trigger_scout', 'promote_queue_top'
+    ];
+    if (adminActions.some(a => cbData.startsWith(a)) && !isAdmin) {
+      return ctx.answerCbQuery('⛔ Akses Ditolak: Hanya Administrator', { show_alert: true });
+    }
+  }
+
   return next();
 });
 
 // 1. COMMAND: /start & /status
 bot.command(['start', 'status'], async (ctx) => {
+  const userId = ctx.from?.id;
+  const isAdmin = CONFIG.TELEGRAM_ADMIN_ID && userId === CONFIG.TELEGRAM_ADMIN_ID;
+
+  // Non-Admin Welcome Screen (Watcher Mode)
+  if (!isAdmin) {
+    const subscribed = isWatcher(userId || 0);
+    const text = `👋 *Halo, ${ctx.from?.first_name || 'Trader'}!*\n\n` +
+      `Selamat datang di *Solana Smart Money & Copy-Trading Bot*!\n` +
+      `Kamu saat ini berada dalam mode *Tamu (Watcher / Read-Only)*.\n\n` +
+      `Status Notifikasi: ${subscribed ? '🔔 *AKTIF (Menerima Alert Sinyal)*' : '🔕 *NON-AKTIF*'}\n\n` +
+      `💡 *Ingin mendapat notifikasi otomatis setiap ada paus borong/jual token?*\n` +
+      `Ketik \`/watch\` atau klik tombol di bawah untuk mengaktifkan notifikasi sinyal.\n\n` +
+      `📋 *Menu yang bisa kamu akses:*\n` +
+      `• \`/positions\` - Lihat koin yang sedang dipegang bot\n` +
+      `• \`/whales\` - Radar 15 dompet paus smart money\n` +
+      `• \`/report\` atau \`/pnl\` - Jurnal performa profit harian\n` +
+      `• \`/quant\` - Audit metrik kuantitatif (Sharpe, Winrate)\n` +
+      `• \`/watch\` - Langganan notifikasi transaksi paus\n` +
+      `• \`/unwatch\` - Berhenti langganan notifikasi\n\n` +
+      `🛡️ *Audit Koin Instan:* Kirimkan Contract Address (CA) token Solana apapun ke sini untuk cek Anti-Rug & Honeypot secara gratis!`;
+
+    return ctx.replyWithMarkdown(text, Markup.inlineKeyboard([
+      [
+        subscribed 
+          ? Markup.button.callback('🔕 Berhenti Notifikasi (/unwatch)', 'action_unwatch')
+          : Markup.button.callback('🔔 Aktifkan Alert Sinyal (/watch)', 'action_watch')
+      ],
+      [
+        Markup.button.callback('💼 Posisi Aktif', 'menu_positions'),
+        Markup.button.callback('🐋 Radar Paus', 'menu_whales')
+      ],
+      [
+        Markup.button.callback('📊 Laporan 24j', 'menu_report'),
+        Markup.button.callback('📐 Metrik Quant', 'menu_quant')
+      ]
+    ]));
+  }
+
+  // Admin Master Dashboard
   const balanceSol = getPaperBalance();
   const solPrice = await getSolPriceUsd();
   const stats = getTradingStats();
@@ -591,6 +680,53 @@ bot.command('unblacklist', async (ctx) => {
   const address = parts[1];
   unblacklistWhale(address);
   await ctx.replyWithMarkdown(`✅ *Dompet Dihapus dari Blacklist!*\n\n📝 *Alamat:* \`${address}\` sekarang diizinkan kembali masuk radar.`);
+});
+
+// COMMAND: /watch
+bot.command('watch', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  addWatcher(userId, ctx.from?.username, ctx.from?.first_name);
+  await ctx.replyWithMarkdown(
+    `🔔 *Mode Watcher Aktif!*\n\n` +
+    `Mulai sekarang, kamu akan menerima notifikasi otomatis setiap kali ada pergerakan paus smart money on-chain, aksi akumulasi, atau sinyal take-profit.\n\n` +
+    `_Ketik \`/unwatch\` kapan saja jika ingin berhenti berlangganan notifikasi._`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('💼 Lihat Posisi Aktif', 'menu_positions')],
+      [Markup.button.callback('🔕 Berhenti Notifikasi', 'action_unwatch')]
+    ])
+  );
+});
+
+// COMMAND: /unwatch
+bot.command('unwatch', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  removeWatcher(userId);
+  await ctx.replyWithMarkdown(
+    `🔕 *Notifikasi Watcher Dinonaktifkan.*\n\n` +
+    `Kamu tidak akan menerima alert otomatis lagi. Kamu tetap bisa mengecek posisi koin secara manual lewat \`/positions\` atau \`/whales\` kapan saja.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🔔 Aktifkan Kembali Notifikasi', 'action_watch')]
+    ])
+  );
+});
+
+// Watcher Action Callbacks
+bot.action('action_watch', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  addWatcher(userId, ctx.from?.username, ctx.from?.first_name);
+  await ctx.answerCbQuery('🔔 Mode Watcher Aktif!');
+  await ctx.replyWithMarkdown(`🔔 *Alert Sinyal Aktif!* Kamu akan menerima notifikasi otomatis setiap ada paus bertransaksi.`);
+});
+
+bot.action('action_unwatch', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  removeWatcher(userId);
+  await ctx.answerCbQuery('🔕 Notifikasi Dimatikan');
+  await ctx.replyWithMarkdown(`🔕 *Notifikasi Dimatikan.* Ketik \`/watch\` untuk menyalakan kembali.`);
 });
 
 // 4. COMMAND: /addwhale <address> <label>
