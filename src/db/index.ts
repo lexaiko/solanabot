@@ -490,7 +490,7 @@ export function getWhalesForPruning(
     return db.prepare(`
       SELECT * FROM whales 
       WHERE consecutive_losses >= ? 
-         OR (total_trades_copied >= 4 AND win_rate < ?)
+         OR (total_trades_copied >= 4 AND win_rate < ? AND total_pnl_sol <= 0)
          OR (created_at <= ? AND (last_trade_at IS NULL OR last_trade_at <= ?))
     `).all(maxLosses, minWinRate, cutoffTime, cutoffTime) as unknown as Whale[];
   } catch {

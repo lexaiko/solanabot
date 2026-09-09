@@ -430,7 +430,7 @@ export async function pruneUnderperformingWhales(): Promise<number> {
     if (whale.tier !== 'PROBATION' && whale.auto_copy) {
       const { getWhaleRollingStats, demoteWhale } = await import('../db/index');
       const rolling = getWhaleRollingStats(whale.label, CONFIG.ROLLING_WINDOW_DAYS);
-      if (rolling.rollingTrades >= 3 && rolling.rollingWinRate < 40.0) {
+      if (rolling.rollingTrades >= 3 && rolling.rollingWinRate < 40.0 && rolling.rollingPnlSol <= 0) {
         demoteWhale(whale.id);
         console.log(`[WhalePruner] 📉 ROLLING ALPHA DECAY: ${whale.label} diturunkan ke [PROBATION] (7d Win Rate: ${rolling.rollingWinRate.toFixed(1)}% dari ${rolling.rollingTrades} trades).`);
         const decayMsg = `📉 *ALPHA DECAY DETECTED: PAUS DIISTIRAHATKAN!*\n\n` +
@@ -483,8 +483,8 @@ export async function pruneUnderperformingWhales(): Promise<number> {
     const pruneThreshold = CONFIG.MAX_CONSECUTIVE_LOSSES_PRUNE || 4;
     if (whale.consecutive_losses >= pruneThreshold) {
       reason = `Performa Buruk Kronis (${whale.consecutive_losses}x Stop-Loss Berturut-turut)`;
-    } else if (whale.total_trades_copied >= 4 && whale.win_rate < CONFIG.MIN_WINRATE_PCT) {
-      reason = `Win Rate Rendah (${whale.win_rate.toFixed(1)}% < ${CONFIG.MIN_WINRATE_PCT}% dari ${whale.total_trades_copied} trade)`;
+    } else if (whale.total_trades_copied >= 4 && whale.win_rate < CONFIG.MIN_WINRATE_PCT && (whale.total_pnl_sol || 0) <= 0) {
+      reason = `Win Rate Rendah (${whale.win_rate.toFixed(1)}% < ${CONFIG.MIN_WINRATE_PCT}% dari ${whale.total_trades_copied} trade dan PnL <= 0)`;
     } else {
       reason = `Tidak Aktif (> ${CONFIG.AUTO_PRUNE_INACTIVE_HOURS} jam tanpa transaksi)`;
     }
