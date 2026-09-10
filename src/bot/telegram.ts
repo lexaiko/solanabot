@@ -46,6 +46,24 @@ import {
 
 export const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
 
+/**
+ * Bulletproof Markdown sender: Falls back to clean text if markdown entities are invalid.
+ * Guarantees the user always receives a response and never gets stuck!
+ */
+export async function safeReplyWithMarkdown(ctx: any, text: string, extra?: any) {
+  try {
+    return await ctx.replyWithMarkdown(text, extra);
+  } catch (err: any) {
+    console.warn('[Telegram] Markdown formatting failed, falling back to clean text:', err.message);
+    const cleanText = text.replace(/[*_`\[\]]/g, '');
+    try {
+      return await ctx.reply(cleanText, extra);
+    } catch (fallbackErr: any) {
+      console.error('[Telegram] Failed to send fallback message:', fallbackErr.message);
+    }
+  }
+}
+
 // Register Telegram notifiers (Admin + Active Watchers Broadcast)
 const sendAdminAlert = async (msg: string, extra?: any) => {
   if (CONFIG.TELEGRAM_ADMIN_ID) {
@@ -1345,13 +1363,65 @@ bot.action('reset_paper_balance', async (ctx) => {
   await ctx.replyWithMarkdown(`🔄 Saldo virtual berhasil direset ke *${CONFIG.INITIAL_PAPER_BALANCE_SOL} SOL*!`);
 });
 
+// Inline Sell Action with Two-Step Confirmation (Anti-Accidental Tap)
 bot.action(/sell_100_(\d+)/, async (ctx) => {
   const posId = parseInt(ctx.match[1], 10);
-  await ctx.answerCbQuery('Mengeksekusi penjualan...');
+  const position = getOpenPositions().find((p: any) => p.id === posId);
+  if (!position) {
+    await ctx.answerCbQuery('⚠️ Posisi tidak ditemukan atau sudah ditutup.');
+    return;
+  }
+  await ctx.answerCbQuery('⚠️ Konfirmasi penjualan dibutuhkan');
+
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`✅ Ya, Jual 100% #${posId}`, `confirm_sell_100_${posId}`),
+      Markup.button.callback(`❌ Batalkan`, `cancel_sell_${posId}`)
+    ]
+  ]);
+
+  const cleanSymbol = (position.token_symbol || '').replace(/[*_`]/g, '');
+  await safeReplyWithMarkdown(
+    ctx,
+    `⚠️ *KONFIRMASI PENJUALAN MANUAL*\n\n` +
+    `Anda akan menjual posisi berikut secara manual:\n` +
+    `• Posisi: *#${posId}*\n` +
+    `• Token: *${cleanSymbol}*\n` +
+    `• Modal: *${position.entry_sol.toFixed(3)} SOL*\n\n` +
+    `_Klik tombol konfirmasi di bawah ini untuk mengeksekusi, atau batalkan jika tidak sengaja tertekan._`,
+    confirmKeyboard
+  );
+});
+
+bot.action(/confirm_sell_100_(\d+)/, async (ctx) => {
+  const posId = parseInt(ctx.match[1], 10);
+  const position = getOpenPositions().find((p: any) => p.id === posId);
+  if (!position) {
+    await ctx.answerCbQuery('⚠️ Posisi sudah tidak aktif atau telah terjual.');
+    try {
+      await ctx.editMessageText(`ℹ️ *Posisi #${posId} sudah ditutup sebelumnya.*`, { parse_mode: 'Markdown' }).catch(() => {});
+    } catch {}
+    return;
+  }
+
+  await ctx.answerCbQuery('🚀 Mengeksekusi penjualan...');
+  try {
+    const cleanSymbol = (position.token_symbol || '').replace(/[*_`]/g, '');
+    await ctx.editMessageText(`⏳ *Mengeksekusi penjualan posisi #${posId} (${cleanSymbol})...*`, { parse_mode: 'Markdown' }).catch(() => {});
+  } catch {}
+
   const result = await executeSellToken(posId, 100, 'MANUAL_INLINE_BUTTON');
   if (!result.success) {
-    await ctx.replyWithMarkdown(`❌ Gagal: ${result.message}`);
+    await safeReplyWithMarkdown(ctx, `❌ *Gagal mengeksekusi penjualan:* ${result.message}`);
   }
+});
+
+bot.action(/cancel_sell_(\d+)/, async (ctx) => {
+  const posId = parseInt(ctx.match[1], 10);
+  await ctx.answerCbQuery('✅ Penjualan dibatalkan');
+  try {
+    await ctx.editMessageText(`🛡️ *Penjualan posisi #${posId} dibatalkan.* Posisi tetap aktif dan dikawal bot secara otomatis.`, { parse_mode: 'Markdown' }).catch(() => {});
+  } catch {}
 });
 
 // Quick Buy Button Action from Token Card
