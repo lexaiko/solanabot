@@ -140,7 +140,7 @@ async function main() {
     stopPositionManager();
     stopWhaleTracker();
     stopWhaleScout();
-    bot.stop();
+    try { bot.stop(); } catch {}
     process.exit(0);
   };
 
