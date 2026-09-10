@@ -15,7 +15,7 @@ import {
   tripCircuitBreaker,
   getDailyStopLossCount
 } from '../db/index';
-import { getTokenMarketData, getSolPriceUsd } from './dexscreener';
+import { getTokenMarketData, getSolPriceUsd, calculatePriceImpactPct } from './dexscreener';
 import { getOnChainBondingCurve, getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { checkTokenSafety } from './antirug';
 import { getBuyQuote, getSellQuote } from './jupiter';
@@ -290,22 +290,23 @@ export async function executeBuyToken(
     return { success: false, message: `Skor keamanan terlalu rendah: ${safety.score}/100` };
   }
 
-  // 3. Compute execution price & tokens received
-  let amountTokens = 0;
+  // 3. Compute realistic execution price, DEX fees & slippage
   const entryPriceUsd = marketData.priceUsd;
+  const isPump = tokenMint.endsWith('pump') || marketData.dexId === 'pumpfun';
+  const dexFeePct = isPump ? 1.0 : 0.25; // 1% Pump.fun curve fee or 0.25% Raydium LP fee
 
-  // Try Jupiter Quote first for high fidelity
-  const jupQuote = await getBuyQuote(tokenMint, amountSol);
-  if (jupQuote && Number(jupQuote.outAmount) > 0) {
-    // Standardize decimals (most SPL tokens are 6 or 9 decimals)
-    amountTokens = (amountSol * solPriceUsd) / entryPriceUsd;
-  } else {
-    // Calculate via DexScreener native price
-    amountTokens = (amountSol * solPriceUsd) / entryPriceUsd;
-  }
+  // Real Price Impact + Realistic Fill Slippage
+  const priceImpactPct = calculatePriceImpactPct(amountSol * solPriceUsd, effectiveLiquidity);
+  const slippageMultiplier = 1 + (priceImpactPct / 100) + ((CONFIG.SLIPPAGE_PCT * 0.25) / 100);
+  const effectiveEntryPriceUsd = entryPriceUsd * slippageMultiplier;
 
-  // 4. Deduct Paper Balance
-  updatePaperBalance(-amountSol);
+  // Net SOL converted to tokens after protocol fee
+  const netSolForTokens = amountSol * (1 - dexFeePct / 100);
+  const amountTokens = (netSolForTokens * solPriceUsd) / effectiveEntryPriceUsd;
+
+  // 4. Deduct Paper Balance (Principal + Real Solana Gas/Priority/Jito Tip)
+  const totalBuyDeductionSol = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL;
+  updatePaperBalance(-totalBuyDeductionSol);
 
   // Institutional Continuous Conditional Risk/Reward Engine
   let targetTpPct = CONFIG.TAKE_PROFIT_PCT;
@@ -334,7 +335,7 @@ export async function executeBuyToken(
     token_symbol: marketData.symbol,
     token_name: marketData.name,
     amount_tokens: amountTokens,
-    entry_price_usd: entryPriceUsd,
+    entry_price_usd: effectiveEntryPriceUsd,
     entry_sol: amountSol,
     whale_source: whale ? whale.label : source,
     target_tp_pct: targetTpPct,
@@ -354,7 +355,7 @@ export async function executeBuyToken(
     `📊 *Rincian Order:*\n` +
     `• Nominal Kita: *${amountSol.toFixed(3)} SOL* (~$${(amountSol * solPriceUsd).toFixed(2)})\n` +
     `${whaleBuyVol}` +
-    `• Harga Entry: *${formatPrice(entryPriceUsd)}*\n` +
+    `• Harga Entry: *${formatPrice(effectiveEntryPriceUsd)}*\n` +
     `• Market Cap: *$${formatNumber(marketData.marketCap)}*\n` +
     `• Likuiditas: *$${formatNumber(effectiveLiquidity)}*\n` +
     `• Anti-Rug Score: *${safety.score}/100* (✅ Aman)\n` +
@@ -392,30 +393,41 @@ export async function executeSellToken(
   const currentPriceUsd = marketData ? marketData.priceUsd : pos.current_price_usd;
   const solPriceUsd = await getSolPriceUsd();
 
-  // Calculate return in SOL
-  const currentValueUsd = pos.amount_tokens * currentPriceUsd * (sellPct / 100);
-  const exitSol = currentValueUsd / solPriceUsd;
+  // Calculate return in SOL with DEX fee & realistic price impact slippage
+  const isPump = pos.token_address.endsWith('pump') || (marketData && marketData.dexId === 'pumpfun');
+  const dexFeePct = isPump ? 1.0 : 0.25; // 1% Pump.fun fee or 0.25% Raydium fee
 
-  // Add proceeds back to paper balance
-  updatePaperBalance(exitSol);
+  const effLiquidity = marketData?.liquidityUsd || 20000;
+  const rawValueUsd = pos.amount_tokens * currentPriceUsd * (sellPct / 100);
+  const priceImpactPct = calculatePriceImpactPct(rawValueUsd, effLiquidity);
+  const slippageMultiplier = Math.max(0.7, 1 - (priceImpactPct / 100) - ((CONFIG.SLIPPAGE_PCT * 0.25) / 100));
+  const effectiveExitPriceUsd = currentPriceUsd * slippageMultiplier;
 
-  // Close position in DB
-  closePosition(pos.id, currentPriceUsd, exitSol, `${reason} (${sellPct}%)`);
+  const grossExitUsd = pos.amount_tokens * effectiveExitPriceUsd * (sellPct / 100);
+  const grossExitSol = grossExitUsd / solPriceUsd;
+  const netExitSolAfterDexFee = grossExitSol * (1 - dexFeePct / 100);
+  
+  // Deduct real Solana Sell Gas / Priority Tip from wallet proceeds
+  const actualCreditedSol = Math.max(0, netExitSolAfterDexFee - CONFIG.ESTIMATED_SELL_FEE_SOL);
+  updatePaperBalance(actualCreditedSol);
+
+  // Close position in DB with true proceeds
+  closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`);
   refreshPositionWebSocketSubscriptions();
 
-  const pnlPct = ((currentPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-  const pnlSol = exitSol - pos.entry_sol;
+  const pnlPct = ((effectiveExitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
+  const grossPnlSol = grossExitSol - (pos.entry_sol * (sellPct / 100));
   const isProfit = pnlPct >= 0;
   const newBalance = getPaperBalance();
 
-  // True Net Fee Accounting
-  const roundTripFeeSol = CONFIG.ESTIMATED_BUY_FEE_SOL + CONFIG.ESTIMATED_SELL_FEE_SOL;
-  const netPnlSol = pnlSol - roundTripFeeSol;
+  // True Net Fee Accounting (includes Buy Gas, Sell Gas, DEX Protocol Fee)
+  const roundTripFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL * (sellPct / 100)) + CONFIG.ESTIMATED_SELL_FEE_SOL + (grossExitSol * (dexFeePct / 100));
+  const netPnlSol = grossPnlSol - roundTripFeeSol;
   const isNetProfit = netPnlSol >= 0;
 
   // Record whale performance for institutional grading & auto-promotion
   if (pos.whale_source && pos.whale_source !== 'MANUAL' && pos.whale_source !== 'MANUAL_SNIPER') {
-    const perf = recordWhaleTrade(pos.whale_source, pnlSol, isProfit);
+    const perf = recordWhaleTrade(pos.whale_source, netPnlSol, isNetProfit);
     if (perf?.promoted) {
       const promoMsg = `🎖️ *PROMOSI ELITE SMART MONEY!*\n\n` +
         `Dompet *${perf.whale.label}* (\`${perf.whale.address.slice(0, 6)}...${perf.whale.address.slice(-4)}\`) berhasil membuktikan profitabilitas!\n` +
@@ -469,11 +481,11 @@ export async function executeSellToken(
     `📝 *Alasan:* \`${reason}\`\n\n` +
     `📊 *Hasil Perdagangan (True Net Accounting):*\n` +
     `• PnL %: *${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%* ${isProfit ? '🟢' : '🔴'}\n` +
-    `• Gross PnL: *${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL* (~$${(pnlSol * solPriceUsd).toFixed(2)})\n` +
+    `• Gross PnL: *${grossPnlSol >= 0 ? '+' : ''}${grossPnlSol.toFixed(4)} SOL* (~$${(grossPnlSol * solPriceUsd).toFixed(2)})\n` +
     `• Biaya On-Chain: *-${roundTripFeeSol.toFixed(4)} SOL* (Gas + Priority + Jito Tip)\n` +
     `• Net PnL Bersih: *${netPnlSol >= 0 ? '+' : ''}${netPnlSol.toFixed(4)} SOL* (~$${(netPnlSol * solPriceUsd).toFixed(2)}) ${isNetProfit ? '💰' : '🔻'}\n` +
     `• Modal Posisi: ${pos.entry_sol.toFixed(3)} SOL\n` +
-    `• Hasil Penjualan: *${exitSol.toFixed(4)} SOL*\n` +
+    `• Hasil Penjualan: *${actualCreditedSol.toFixed(4)} SOL*\n` +
     `• Saldo Virtual Sekarang: *${newBalance.toFixed(3)} SOL*\n` +
     noteSection + '\n' +
     `_Riwayat tersimpan ke database._`;
@@ -662,18 +674,22 @@ export async function evaluatePosition(
     // 1. STAGE 1 TAKE-PROFIT (Adaptive Target): Jual 50%, Modal Aman, Sisanya Free-Roll Moonbag!
     if (pos.is_half_closed === 0 && pnlPct >= targetTp) {
       console.log(`[TradeManager] 🎯 STAGE 1 TP (+${pnlPct.toFixed(1)}% >= target ${targetTp}%) tercapai untuk ${pos.token_symbol}! Menjual 50%...`);
+      const isPump = pos.token_address.endsWith('pump');
+      const dexFeePct = isPump ? 1.0 : 0.25;
       const halfTokens = pos.amount_tokens * 0.5;
-      const soldUsd = halfTokens * currentPrice;
-      const soldSol = soldUsd / solPriceUsd;
+      const grossSoldUsd = halfTokens * currentPrice;
+      const grossSoldSol = grossSoldUsd / solPriceUsd;
+      const netSoldSol = grossSoldSol * (1 - dexFeePct / 100);
+      const creditedSol = Math.max(0, netSoldSol - CONFIG.ESTIMATED_SELL_FEE_SOL);
 
-      updatePaperBalance(soldSol);
-      halfClosePosition(pos.id, currentPrice, soldSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`);
+      updatePaperBalance(creditedSol);
+      halfClosePosition(pos.id, currentPrice, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`);
 
       const remainingBalance = getPaperBalance();
       const halfTpAlert = `🎉 *STAGE 1 TAKE-PROFIT DIEKSEKUSI! (50% DIJUAL)*\n\n` +
         `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
         `📈 *Profit Terkunci:* *+${pnlPct.toFixed(1)}%* (Target: +${targetTp}%) 🟢\n` +
-        `💰 *Dana Masuk:* *${soldSol.toFixed(4)} SOL* (~$${(soldSol * solPriceUsd).toFixed(2)})\n` +
+        `💰 *Dana Masuk:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
         `🛡️ *Status:* *Modal Awal Diamankan!* Saldo bebas risiko.\n` +
         `🌕 *Sisa 50% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
         `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
