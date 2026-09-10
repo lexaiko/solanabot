@@ -807,11 +807,25 @@ bot.command('delwhale', async (ctx) => {
   }
 });
 
-// 6. COMMAND: /positions
 bot.command('positions', async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const page = parts.length > 1 ? parseInt(parts[1], 10) || 1 : 1;
   await renderPositions(ctx, page);
+});
+
+bot.action('menu_positions', async (ctx) => {
+  try { await ctx.answerCbQuery('🔄 Memperbarui data posisi...'); } catch {}
+  await renderPositions(ctx, 1);
+});
+
+bot.action(/positions_page_(\d+)/, async (ctx) => {
+  const page = parseInt(ctx.match[1], 10);
+  try { await ctx.answerCbQuery('🔄 Memperbarui data posisi...'); } catch {}
+  await renderPositions(ctx, page);
+});
+
+bot.action('positions_noop', async (ctx) => {
+  try { await ctx.answerCbQuery(); } catch {}
 });
 
 function formatPrice(val: number): string {
@@ -838,15 +852,29 @@ async function renderPositions(ctx: any, page: number = 1) {
   const solPrice = await getSolPriceUsd();
 
   if (positions.length === 0) {
-    return ctx.replyWithMarkdown(
-      `💼 *POSISI TRADE AKTIF (0/${CONFIG.MAX_OPEN_POSITIONS})*\n\n` +
+    const emptyText = `💼 *POSISI TRADE AKTIF (0/${CONFIG.MAX_OPEN_POSITIONS})*\n\n` +
       `💰 *Kas Tersedia:* *${cashBalanceSol.toFixed(3)} SOL* (~$${(cashBalanceSol * solPrice).toFixed(2)})\n` +
       `📊 *Status:* Tidak ada posisi terbuka saat ini (100% modal aman dalam kas).\n\n` +
-      `_Bot akan membuka posisi otomatis saat dompet paus terverifikasi membeli koin aman, atau kamu bisa paste CA untuk beli manual._`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback('🔍 Pindai Scout Sekarang', 'trigger_scout'), Markup.button.callback('🐋 Radar Paus', 'menu_whales')]
-      ])
-    );
+      `_Bot akan membuka posisi otomatis saat dompet paus terverifikasi membeli koin aman, atau kamu bisa paste CA untuk beli manual._`;
+
+    const emptyKeyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔄 Refresh Posisi', 'menu_positions'),
+        Markup.button.callback('🔍 Pindai Scout', 'trigger_scout')
+      ],
+      [
+        Markup.button.callback('🐋 Radar Paus', 'menu_whales'),
+        Markup.button.callback('📊 Laporan 24j', 'menu_report')
+      ]
+    ]);
+
+    if (ctx.callbackQuery) {
+      return await ctx.editMessageText(emptyText, { parse_mode: 'Markdown', ...emptyKeyboard }).catch(async () => {
+        await safeReplyWithMarkdown(ctx, emptyText, emptyKeyboard);
+      });
+    }
+
+    return await safeReplyWithMarkdown(ctx, emptyText, emptyKeyboard);
   }
 
   let totalInvestedSol = 0;
