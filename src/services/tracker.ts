@@ -3,6 +3,7 @@ import { CONFIG } from '../config';
 import { getActiveWhales } from '../db/index';
 import { Whale } from '../types/index';
 import { getDedicatedConnection, getDedicatedEndpoint } from './solanaConnection';
+import { getSolPriceUsd } from './dexscreener';
 
 const trackerEndpoint = getDedicatedEndpoint('WHALE_TRACKER');
 const wsUrl = trackerEndpoint.wsUrl;
@@ -13,10 +14,14 @@ const DEX_PROGRAM_IDS = new Set([
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun
   '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium Liquidity Pool V4
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
+  'routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS', // Raydium Router
   'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', // Meteora DLMM
   'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB', // Meteora Pools
   'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter V6
   'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB', // Jupiter V4
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', // Orca Whirlpool
+  '6m2CDdhRgxpHMFZFwqmGaDvgVMDeKikoPkMXvjhe8ScU', // OKX DEX Router
 ]);
 
 const IGNORED_MINTS = new Set([
@@ -169,7 +174,7 @@ async function parseAndExecuteBuy(whale: Whale, signature: string) {
     });
     if (!tx || !tx.meta) return;
 
-    const parsedTrade = extractTokenTradeFromTx(whale.address, tx);
+    const parsedTrade = await extractTokenTradeFromTx(whale.address, tx);
     if (!parsedTrade) return;
 
     if (parsedTrade.action === 'BUY') {
@@ -190,10 +195,10 @@ async function parseAndExecuteBuy(whale: Whale, signature: string) {
   }
 }
 
-function extractTokenTradeFromTx(
+async function extractTokenTradeFromTx(
   whaleAddress: string,
   tx: ParsedTransactionWithMeta
-): { action: 'BUY' | 'SELL'; tokenMint: string; solAmount: number; tokenAmount: number } | null {
+): Promise<{ action: 'BUY' | 'SELL'; tokenMint: string; solAmount: number; tokenAmount: number } | null> {
   const meta = tx.meta;
   if (!meta) return null;
 
@@ -221,7 +226,7 @@ function extractTokenTradeFromTx(
     }
   }
 
-  // 2. Calculate SOL change for the whale
+  // 2. Calculate native SOL change for the whale
   const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
   const whaleIndex = accountKeys.indexOf(whaleAddress);
   if (whaleIndex === -1) return null;
@@ -229,11 +234,59 @@ function extractTokenTradeFromTx(
   const preSol = meta.preBalances[whaleIndex] || 0;
   const postSol = meta.postBalances[whaleIndex] || 0;
   const solDifference = Math.abs(preSol - postSol) / 1_000_000_000;
+  const solSpent = preSol > postSol ? (preSol - postSol) / 1_000_000_000 : 0;
 
-  // 3. Identify token balance increment or decrement
+  // 2b. Calculate stablecoin & wrapped quote token spent by whale (USDC, USDT, WSOL)
   const preTokenBalances = meta.preTokenBalances || [];
   const postTokenBalances = meta.postTokenBalances || [];
 
+  let usdcSpent = 0;
+  let wsolSpent = 0;
+
+  for (const post of postTokenBalances) {
+    if (post.owner === whaleAddress) {
+      const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
+      const preAmount = pre ? parseFloat(pre.uiTokenAmount.uiAmountString || '0') : 0;
+      const postAmount = parseFloat(post.uiTokenAmount.uiAmountString || '0');
+
+      if (
+        post.mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' || // USDC
+        post.mint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB' // USDT
+      ) {
+        if (preAmount > postAmount) {
+          usdcSpent += preAmount - postAmount;
+        }
+      } else if (post.mint === 'So11111111111111111111111111111111111111112') { // WSOL
+        if (preAmount > postAmount) {
+          wsolSpent += preAmount - postAmount;
+        }
+      }
+    }
+  }
+
+  // Determine effective SOL spent
+  let effectiveSolSpent = solSpent >= 0.01 ? solSpent : 0;
+
+  // If whale spent WSOL
+  if (wsolSpent >= 0.01) {
+    effectiveSolSpent = Math.max(effectiveSolSpent, wsolSpent);
+  }
+
+  // If whale spent USDC or USDT, convert to equivalent SOL
+  if (usdcSpent >= 15) { // minimum $15 USD spent by whale
+    try {
+      const solPriceUsd = await getSolPriceUsd();
+      if (solPriceUsd > 0) {
+        const convertedSol = usdcSpent / solPriceUsd;
+        effectiveSolSpent = Math.max(effectiveSolSpent, convertedSol);
+      }
+    } catch {
+      // Fallback rough estimate if price API is down
+      effectiveSolSpent = Math.max(effectiveSolSpent, usdcSpent / 140);
+    }
+  }
+
+  // 3. Identify target token balance increment or decrement
   for (const post of postTokenBalances) {
     if (post.owner === whaleAddress) {
       const tokenMint = post.mint;
@@ -243,22 +296,22 @@ function extractTokenTradeFromTx(
       const preAmount = pre ? parseFloat(pre.uiTokenAmount.uiAmountString || '0') : 0;
       const postAmount = parseFloat(post.uiTokenAmount.uiAmountString || '0');
 
-      // Detect BUY: token balance increased and SOL decreased
-      if (postAmount > preAmount && solDifference >= 0.02) {
+      // Detect BUY: target token balance increased and whale spent SOL or USDC/WSOL!
+      if (postAmount > preAmount && effectiveSolSpent >= 0.02) {
         return {
           action: 'BUY',
           tokenMint,
-          solAmount: parseFloat(solDifference.toFixed(4)),
+          solAmount: parseFloat(effectiveSolSpent.toFixed(4)),
           tokenAmount: postAmount - preAmount
         };
       }
 
-      // Detect SELL: token balance decreased
+      // Detect SELL: target token balance decreased
       if (postAmount < preAmount && (preAmount - postAmount) > 0) {
         return {
           action: 'SELL',
           tokenMint,
-          solAmount: parseFloat(solDifference.toFixed(4)),
+          solAmount: parseFloat((effectiveSolSpent || solDifference).toFixed(4)),
           tokenAmount: preAmount - postAmount
         };
       }
