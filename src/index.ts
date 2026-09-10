@@ -4,6 +4,7 @@ import { bot } from './bot/telegram';
 import { startWhaleTracker, stopWhaleTracker, setWhaleTradeHandler } from './services/tracker';
 import { startPositionManager, stopPositionManager, executeBuyToken, executeWhaleSellFollow } from './services/tradeManager';
 import { startWhaleScout, stopWhaleScout } from './services/whaleScout';
+import { startOutcomeTracker, stopOutcomeTracker } from './services/outcomeTracker';
 
 async function main() {
   console.log('====================================================');
@@ -94,6 +95,7 @@ async function main() {
   startPositionManager();
   startWhaleTracker();
   startWhaleScout();
+  startOutcomeTracker();
 
   // 4. Start Telegram Bot with Resilient Auto-Retry Loop
   async function startTelegramWithRetry() {
@@ -133,6 +135,7 @@ async function main() {
     stopPositionManager();
     stopWhaleTracker();
     stopWhaleScout();
+    stopOutcomeTracker();
     try { bot.stop(); } catch {}
     process.exit(0);
   };

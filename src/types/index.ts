@@ -94,3 +94,58 @@ export interface QueuedWhale {
   created_at: string;
 }
 
+export type EarlyEntryStatus = 'DISCOVERED' | 'QUALIFIED' | 'OUTCOME_PENDING' | 'OUTCOME_COMPLETE' | 'REJECTED';
+
+export interface EarlyEntryEvent {
+  id?: number;
+  wallet_address: string;
+  token_mint: string;
+  pool_address: string;
+  first_pool_trade_at: string;
+  wallet_entry_at: string;
+  entry_age_seconds: number;
+  entry_signature: string;
+  entry_price_usd?: number;
+  entry_mc_usd?: number;
+  entry_liquidity_usd?: number;
+  sol_spent?: number;
+  discovered_at: string;
+  status: EarlyEntryStatus;
+}
+
+export type OutcomeCheckpoint = '30m' | '1h' | '6h' | '24h';
+
+export interface EarlyEntryOutcome {
+  id?: number;
+  event_id: number;
+  checkpoint: OutcomeCheckpoint;
+  price_usd: number;
+  pnl_pct: number;
+  max_drawdown_pct: number;
+  measured_at: string;
+}
+
+export interface WalletIntelligence {
+  wallet_address: string;
+  funder_address?: string;
+  funder_checked_at?: string;
+  win_rate?: number;
+  total_trades?: number;
+  win_rate_checked_at?: string;
+  first_seen_at: string;
+  last_checked_at: string;
+  analysis_status?: string;
+}
+
+export interface WalletRecurrenceMetrics {
+  wallet_address: string;
+  total_early_entries: number;
+  successful_entries: number;
+  failed_entries: number;
+  pending_entries: number;
+  hit_rate: number;
+  avg_entry_age_seconds: number;
+  median_entry_age_seconds: number;
+  distinct_tokens: string[];
+}
+

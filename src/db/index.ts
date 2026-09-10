@@ -1,7 +1,18 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { CONFIG } from '../config';
-import { Whale, Position, TradeHistoryItem, QueuedWhale } from '../types/index';
+import { 
+  Whale, 
+  Position, 
+  TradeHistoryItem, 
+  QueuedWhale,
+  EarlyEntryEvent,
+  EarlyEntryOutcome,
+  EarlyEntryStatus,
+  OutcomeCheckpoint,
+  WalletIntelligence,
+  WalletRecurrenceMetrics
+} from '../types/index';
 import { calculateComprehensiveQuantMetrics, QuantMetricsResult } from '../services/quantMetrics';
 
 const dbPath = path.resolve(process.cwd(), 'tradingbot.db');
@@ -103,6 +114,54 @@ export function initDatabase() {
       first_name TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS early_entry_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wallet_address TEXT NOT NULL,
+      token_mint TEXT NOT NULL,
+      pool_address TEXT NOT NULL,
+      first_pool_trade_at TEXT NOT NULL,
+      wallet_entry_at TEXT NOT NULL,
+      entry_age_seconds INTEGER NOT NULL,
+      entry_signature TEXT NOT NULL UNIQUE,
+      entry_price_usd REAL,
+      entry_mc_usd REAL,
+      entry_liquidity_usd REAL,
+      sol_spent REAL,
+      discovered_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'DISCOVERED'
+    );
+
+    CREATE TABLE IF NOT EXISTS early_entry_outcomes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      price_usd REAL,
+      pnl_pct REAL,
+      max_drawdown_pct REAL,
+      measured_at TEXT NOT NULL,
+      UNIQUE(event_id, checkpoint),
+      FOREIGN KEY(event_id) REFERENCES early_entry_events(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_intelligence (
+      wallet_address TEXT PRIMARY KEY,
+      funder_address TEXT,
+      funder_checked_at TEXT,
+      win_rate REAL,
+      total_trades INTEGER,
+      win_rate_checked_at TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_checked_at TEXT NOT NULL,
+      analysis_status TEXT DEFAULT 'ACTIVE'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_early_entry_wallet ON early_entry_events(wallet_address);
+    CREATE INDEX IF NOT EXISTS idx_early_entry_token ON early_entry_events(token_mint);
+    CREATE INDEX IF NOT EXISTS idx_early_entry_discovered ON early_entry_events(discovered_at);
+    CREATE INDEX IF NOT EXISTS idx_early_entry_status ON early_entry_events(status);
+    CREATE INDEX IF NOT EXISTS idx_early_entry_wallet_token ON early_entry_events(wallet_address, token_mint);
+    CREATE INDEX IF NOT EXISTS idx_early_outcome_event ON early_entry_outcomes(event_id);
   `);
 
   // Migrations for existing DB instances
@@ -121,6 +180,54 @@ export function initDatabase() {
   try { db.exec('ALTER TABLE positions ADD COLUMN target_sl_pct REAL DEFAULT 20.0;'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS whale_blacklist (address TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT NOT NULL);'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS watchers (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL);'); } catch {}
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS early_entry_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_address TEXT NOT NULL,
+        token_mint TEXT NOT NULL,
+        pool_address TEXT NOT NULL,
+        first_pool_trade_at TEXT NOT NULL,
+        wallet_entry_at TEXT NOT NULL,
+        entry_age_seconds INTEGER NOT NULL,
+        entry_signature TEXT NOT NULL UNIQUE,
+        entry_price_usd REAL,
+        entry_mc_usd REAL,
+        entry_liquidity_usd REAL,
+        sol_spent REAL,
+        discovered_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'DISCOVERED'
+      );
+      CREATE TABLE IF NOT EXISTS early_entry_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        checkpoint TEXT NOT NULL,
+        price_usd REAL,
+        pnl_pct REAL,
+        max_drawdown_pct REAL,
+        measured_at TEXT NOT NULL,
+        UNIQUE(event_id, checkpoint),
+        FOREIGN KEY(event_id) REFERENCES early_entry_events(id)
+      );
+      CREATE TABLE IF NOT EXISTS wallet_intelligence (
+        wallet_address TEXT PRIMARY KEY,
+        funder_address TEXT,
+        funder_checked_at TEXT,
+        win_rate REAL,
+        total_trades INTEGER,
+        win_rate_checked_at TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_checked_at TEXT NOT NULL,
+        analysis_status TEXT DEFAULT 'ACTIVE'
+      );
+      CREATE INDEX IF NOT EXISTS idx_early_entry_wallet ON early_entry_events(wallet_address);
+      CREATE INDEX IF NOT EXISTS idx_early_entry_token ON early_entry_events(token_mint);
+      CREATE INDEX IF NOT EXISTS idx_early_entry_discovered ON early_entry_events(discovered_at);
+      CREATE INDEX IF NOT EXISTS idx_early_entry_status ON early_entry_events(status);
+      CREATE INDEX IF NOT EXISTS idx_early_entry_wallet_token ON early_entry_events(wallet_address, token_mint);
+      CREATE INDEX IF NOT EXISTS idx_early_outcome_event ON early_entry_outcomes(event_id);
+    `);
+  } catch {}
 
 
 
@@ -924,6 +1031,338 @@ export function getPortfolioQuantMetrics(): QuantMetricsResult {
   } catch (err: any) {
     console.error('[DB] Error computing portfolio quant metrics:', err.message);
     return calculateComprehensiveQuantMetrics([], CONFIG.INITIAL_PAPER_BALANCE_SOL);
+  }
+}
+
+// ============================================================================
+// CROSS-TOKEN EARLY-MOVER RECURRENCE & PERSISTENT EVENT LEDGER
+// ============================================================================
+
+/**
+ * Records an early entry discovery event idempotently using entry_signature as unique key.
+ * Preserves discovery denominator and canonical entry conditions.
+ */
+export function recordEarlyEntryEvent(event: EarlyEntryEvent): { id: number; inserted: boolean } {
+  try {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO early_entry_events (
+        wallet_address, token_mint, pool_address,
+        first_pool_trade_at, wallet_entry_at, entry_age_seconds,
+        entry_signature, entry_price_usd, entry_mc_usd, entry_liquidity_usd,
+        sol_spent, discovered_at, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const res = stmt.run(
+      event.wallet_address,
+      event.token_mint,
+      event.pool_address,
+      event.first_pool_trade_at,
+      event.wallet_entry_at,
+      event.entry_age_seconds,
+      event.entry_signature,
+      event.entry_price_usd !== undefined ? event.entry_price_usd : null,
+      event.entry_mc_usd !== undefined ? event.entry_mc_usd : null,
+      event.entry_liquidity_usd !== undefined ? event.entry_liquidity_usd : null,
+      event.sol_spent !== undefined ? event.sol_spent : null,
+      event.discovered_at,
+      event.status || 'DISCOVERED'
+    );
+
+    const row = db.prepare('SELECT id, status FROM early_entry_events WHERE entry_signature = ?').get(event.entry_signature) as { id: number; status: string } | undefined;
+    return {
+      id: row ? row.id : Number(res.lastInsertRowid),
+      inserted: res.changes > 0
+    };
+  } catch (err: any) {
+    console.error('[DB] recordEarlyEntryEvent error:', err.message);
+    const existing = db.prepare('SELECT id FROM early_entry_events WHERE entry_signature = ?').get(event.entry_signature) as { id: number } | undefined;
+    return { id: existing ? existing.id : 0, inserted: false };
+  }
+}
+
+export function updateEarlyEntryStatus(entrySignature: string, status: EarlyEntryStatus): boolean {
+  try {
+    const res = db.prepare('UPDATE early_entry_events SET status = ? WHERE entry_signature = ?').run(status, entrySignature);
+    return res.changes > 0;
+  } catch (err: any) {
+    console.error('[DB] updateEarlyEntryStatus error:', err.message);
+    return false;
+  }
+}
+
+export function updateEarlyEntryStatusById(id: number, status: EarlyEntryStatus): boolean {
+  try {
+    const res = db.prepare('UPDATE early_entry_events SET status = ? WHERE id = ?').run(status, id);
+    return res.changes > 0;
+  } catch (err: any) {
+    console.error('[DB] updateEarlyEntryStatusById error:', err.message);
+    return false;
+  }
+}
+
+export function getEarlyEntryBySignature(entrySignature: string): EarlyEntryEvent | null {
+  try {
+    const row = db.prepare('SELECT * FROM early_entry_events WHERE entry_signature = ?').get(entrySignature) as any;
+    if (!row) return null;
+    return {
+      id: row.id,
+      wallet_address: row.wallet_address,
+      token_mint: row.token_mint,
+      pool_address: row.pool_address,
+      first_pool_trade_at: row.first_pool_trade_at,
+      wallet_entry_at: row.wallet_entry_at,
+      entry_age_seconds: row.entry_age_seconds,
+      entry_signature: row.entry_signature,
+      entry_price_usd: row.entry_price_usd ?? undefined,
+      entry_mc_usd: row.entry_mc_usd ?? undefined,
+      entry_liquidity_usd: row.entry_liquidity_usd ?? undefined,
+      sol_spent: row.sol_spent ?? undefined,
+      discovered_at: row.discovered_at,
+      status: row.status
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Retrieves events that need outcome checkpoints tracking (30m, 1h, 6h, 24h).
+ */
+export function getPendingOutcomeEvents(): Array<EarlyEntryEvent & { id: number; measured_checkpoints: string }> {
+  try {
+    const rows = db.prepare(`
+      SELECT e.*, 
+        GROUP_CONCAT(o.checkpoint) as measured_checkpoints
+      FROM early_entry_events e
+      LEFT JOIN early_entry_outcomes o ON e.id = o.event_id
+      WHERE e.status IN ('QUALIFIED', 'OUTCOME_PENDING')
+      GROUP BY e.id
+    `).all() as any[];
+
+    return rows.map(r => ({
+      id: r.id,
+      wallet_address: r.wallet_address,
+      token_mint: r.token_mint,
+      pool_address: r.pool_address,
+      first_pool_trade_at: r.first_pool_trade_at,
+      wallet_entry_at: r.wallet_entry_at,
+      entry_age_seconds: r.entry_age_seconds,
+      entry_signature: r.entry_signature,
+      entry_price_usd: r.entry_price_usd ?? undefined,
+      entry_mc_usd: r.entry_mc_usd ?? undefined,
+      entry_liquidity_usd: r.entry_liquidity_usd ?? undefined,
+      sol_spent: r.sol_spent ?? undefined,
+      discovered_at: r.discovered_at,
+      status: r.status,
+      measured_checkpoints: r.measured_checkpoints || ''
+    }));
+  } catch (err: any) {
+    console.error('[DB] getPendingOutcomeEvents error:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Records a forward outcome checkpoint measurement.
+ */
+export function recordEarlyEntryOutcome(outcome: EarlyEntryOutcome): boolean {
+  try {
+    const res = db.prepare(`
+      INSERT OR IGNORE INTO early_entry_outcomes (
+        event_id, checkpoint, price_usd, pnl_pct, max_drawdown_pct, measured_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      outcome.event_id,
+      outcome.checkpoint,
+      outcome.price_usd,
+      outcome.pnl_pct,
+      outcome.max_drawdown_pct,
+      outcome.measured_at
+    );
+    return res.changes > 0;
+  } catch (err: any) {
+    console.error('[DB] recordEarlyEntryOutcome error:', err.message);
+    return false;
+  }
+}
+
+/**
+ * Helius Free-Tier Optimization: Wallet Intelligence Cache
+ */
+export function getWalletIntelligence(walletAddress: string): WalletIntelligence | null {
+  try {
+    const row = db.prepare('SELECT * FROM wallet_intelligence WHERE wallet_address = ?').get(walletAddress) as any;
+    if (!row) return null;
+    return {
+      wallet_address: row.wallet_address,
+      funder_address: row.funder_address ?? undefined,
+      funder_checked_at: row.funder_checked_at ?? undefined,
+      win_rate: row.win_rate !== null && row.win_rate !== undefined ? row.win_rate : undefined,
+      total_trades: row.total_trades !== null && row.total_trades !== undefined ? row.total_trades : undefined,
+      win_rate_checked_at: row.win_rate_checked_at ?? undefined,
+      first_seen_at: row.first_seen_at,
+      last_checked_at: row.last_checked_at,
+      analysis_status: row.analysis_status ?? 'ACTIVE'
+    };
+  } catch (err: any) {
+    console.error('[DB] getWalletIntelligence error:', err.message);
+    return null;
+  }
+}
+
+export function saveWalletIntelligence(intel: Partial<WalletIntelligence> & { wallet_address: string }): void {
+  try {
+    const now = new Date().toISOString();
+    const existing = getWalletIntelligence(intel.wallet_address);
+    if (!existing) {
+      db.prepare(`
+        INSERT INTO wallet_intelligence (
+          wallet_address, funder_address, funder_checked_at,
+          win_rate, total_trades, win_rate_checked_at,
+          first_seen_at, last_checked_at, analysis_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        intel.wallet_address,
+        intel.funder_address ?? null,
+        intel.funder_checked_at ?? (intel.funder_address ? now : null),
+        intel.win_rate !== undefined ? intel.win_rate : null,
+        intel.total_trades !== undefined ? intel.total_trades : null,
+        intel.win_rate_checked_at ?? (intel.win_rate !== undefined ? now : null),
+        intel.first_seen_at || now,
+        now,
+        intel.analysis_status || 'ACTIVE'
+      );
+    } else {
+      db.prepare(`
+        UPDATE wallet_intelligence SET
+          funder_address = COALESCE(?, funder_address),
+          funder_checked_at = COALESCE(?, funder_checked_at),
+          win_rate = COALESCE(?, win_rate),
+          total_trades = COALESCE(?, total_trades),
+          win_rate_checked_at = COALESCE(?, win_rate_checked_at),
+          last_checked_at = ?,
+          analysis_status = COALESCE(?, analysis_status)
+        WHERE wallet_address = ?
+      `).run(
+        intel.funder_address ?? null,
+        intel.funder_checked_at ?? (intel.funder_address ? now : null),
+        intel.win_rate !== undefined ? intel.win_rate : null,
+        intel.total_trades !== undefined ? intel.total_trades : null,
+        intel.win_rate_checked_at ?? (intel.win_rate !== undefined ? now : null),
+        now,
+        intel.analysis_status ?? null,
+        intel.wallet_address
+      );
+    }
+  } catch (err: any) {
+    console.error('[DB] saveWalletIntelligence error:', err.message);
+  }
+}
+
+/**
+ * Cross-Token Recurrence Query:
+ * Calculates total distinct token early entries, outcome results (wins/losses), hit rate, and canonical entry ages.
+ */
+export function getWalletRecurrenceMetrics(walletAddress: string, lookbackDays: number = 30): WalletRecurrenceMetrics {
+  try {
+    const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+    
+    // Select all early entry events for this wallet within lookback
+    const events = db.prepare(`
+      SELECT e.id, e.token_mint, e.entry_age_seconds, e.status, e.discovered_at
+      FROM early_entry_events e
+      WHERE e.wallet_address = ? AND e.discovered_at >= ?
+      ORDER BY e.id ASC
+    `).all(walletAddress, cutoff) as Array<{ id: number; token_mint: string; entry_age_seconds: number; status: string; discovered_at: string }>;
+
+    if (events.length === 0) {
+      return {
+        wallet_address: walletAddress,
+        total_early_entries: 0,
+        successful_entries: 0,
+        failed_entries: 0,
+        pending_entries: 0,
+        hit_rate: 0,
+        avg_entry_age_seconds: 0,
+        median_entry_age_seconds: 0,
+        distinct_tokens: []
+      };
+    }
+
+    const distinctTokens = Array.from(new Set(events.map(e => e.token_mint)));
+    const total_early_entries = distinctTokens.length;
+
+    let successfulEntries = 0;
+    let failedEntries = 0;
+    let pendingEntries = 0;
+
+    for (const token of distinctTokens) {
+      const tokenEvents = events.filter(e => e.token_mint === token);
+      const eventIds = tokenEvents.map(e => e.id);
+      
+      const placeholders = eventIds.map(() => '?').join(',');
+      const outcomes = db.prepare(`
+        SELECT checkpoint, price_usd, pnl_pct, max_drawdown_pct 
+        FROM early_entry_outcomes 
+        WHERE event_id IN (${placeholders})
+      `).all(...eventIds) as Array<{ checkpoint: string; price_usd: number; pnl_pct: number; max_drawdown_pct: number }>;
+
+      if (outcomes.length === 0) {
+        pendingEntries++;
+        continue;
+      }
+
+      // Baseline winner definition: price reaches >= +80% within 1h and drawdown does not exceed -40%
+      const winCheck = outcomes.some(o => 
+        (o.checkpoint === '30m' || o.checkpoint === '1h') && 
+        (o.pnl_pct >= 80) && 
+        (o.max_drawdown_pct > -40)
+      );
+
+      if (winCheck) {
+        successfulEntries++;
+      } else {
+        const has1hOrLater = outcomes.some(o => o.checkpoint === '1h' || o.checkpoint === '6h' || o.checkpoint === '24h');
+        if (has1hOrLater) {
+          failedEntries++;
+        } else {
+          pendingEntries++;
+        }
+      }
+    }
+
+    const hit_rate = total_early_entries > 0 ? (successfulEntries / total_early_entries) * 100 : 0;
+    
+    const ages = events.map(e => e.entry_age_seconds).sort((a, b) => a - b);
+    const avg_entry_age_seconds = ages.reduce((a, b) => a + b, 0) / ages.length;
+    const mid = Math.floor(ages.length / 2);
+    const median_entry_age_seconds = ages.length % 2 !== 0 ? ages[mid] : (ages[mid - 1] + ages[mid]) / 2;
+
+    return {
+      wallet_address: walletAddress,
+      total_early_entries,
+      successful_entries: successfulEntries,
+      failed_entries: failedEntries,
+      pending_entries: pendingEntries,
+      hit_rate,
+      avg_entry_age_seconds,
+      median_entry_age_seconds,
+      distinct_tokens: distinctTokens
+    };
+  } catch (err: any) {
+    console.error('[DB] getWalletRecurrenceMetrics error:', err.message);
+    return {
+      wallet_address: walletAddress,
+      total_early_entries: 0,
+      successful_entries: 0,
+      failed_entries: 0,
+      pending_entries: 0,
+      hit_rate: 0,
+      avg_entry_age_seconds: 0,
+      median_entry_age_seconds: 0,
+      distinct_tokens: []
+    };
   }
 }
 

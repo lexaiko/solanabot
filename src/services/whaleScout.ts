@@ -12,12 +12,18 @@ import {
   getWhaleQueue,
   promoteQueueWhaleToActive,
   isWhaleBlacklisted,
-  blacklistWhale 
+  blacklistWhale,
+  recordEarlyEntryEvent,
+  updateEarlyEntryStatus,
+  getWalletIntelligence,
+  saveWalletIntelligence,
+  getWalletRecurrenceMetrics
 } from '../db/index';
 import { refreshWhaleSubscriptions } from './tracker';
 import { getTokenMarketData } from './dexscreener';
 import { isCabalSuspect } from './cabalDetector';
 import { connection } from './solanaConnection';
+import { WalletRecurrenceMetrics } from '../types/index';
 
 type TelegramNotifier = (message: string, extra?: any) => Promise<void>;
 let scoutNotifier: TelegramNotifier | null = null;
@@ -70,6 +76,9 @@ export interface SmartMoneyCandidate {
   pastTxCount: number;       // Total historical tx count on-chain
   isMigrationInsider: boolean;
   funderAddress?: string;    // Detected funding source wallet (for cluster deduplication)
+  entryAgeSeconds?: number;
+  entrySignature?: string;
+  recurrence?: WalletRecurrenceMetrics;
 }
 
 /**
@@ -211,6 +220,15 @@ const KNOWN_COMMON_FUNDERS = new Set([
 const MAX_FUNDING_BATCHES = 3; // max 600 sigs scanned per wallet
 
 async function findFundingSource(addr: string): Promise<string> {
+  // ── Helius Free-Tier Optimization: Check persistent SQLite cache first ──
+  const cached = getWalletIntelligence(addr);
+  if (cached && cached.funder_address) {
+    if (cached.funder_address === 'UNKNOWN' || KNOWN_COMMON_FUNDERS.has(cached.funder_address)) {
+      return `ORIGIN_${addr}`;
+    }
+    return cached.funder_address;
+  }
+
   const BATCH_SIZE = 200;
   let beforeCursor: string | undefined = undefined;
   let oldestSigFound: string | null = null;
@@ -238,7 +256,10 @@ async function findFundingSource(addr: string): Promise<string> {
     // Otherwise, continue paginating to find older transactions
   }
 
-  if (!oldestSigFound) return `ORIGIN_${addr}`;
+  if (!oldestSigFound) {
+    saveWalletIntelligence({ wallet_address: addr, funder_address: 'UNKNOWN' });
+    return `ORIGIN_${addr}`;
+  }
 
   // Parse the oldest transaction we found to identify the funding source
   const parsedTx = await connection.getParsedTransaction(oldestSigFound, {
@@ -247,6 +268,7 @@ async function findFundingSource(addr: string): Promise<string> {
   });
 
   if (!parsedTx?.meta?.preBalances || !parsedTx?.meta?.postBalances) {
+    saveWalletIntelligence({ wallet_address: addr, funder_address: 'UNKNOWN' });
     return `ORIGIN_${addr}`;
   }
 
@@ -259,6 +281,8 @@ async function findFundingSource(addr: string): Promise<string> {
     const postBal = parsedTx.meta.postBalances[i] || 0;
     // This account's SOL balance decreased → it sent SOL to our wallet
     if (preBal > postBal && (preBal - postBal) > 5_000_000) { // > 0.005 SOL
+      saveWalletIntelligence({ wallet_address: addr, funder_address: key });
+
       // If funder is a known exchange/bridge, do NOT group wallets together.
       // Two separate traders withdrawing from the same CEX are not the same entity.
       if (KNOWN_COMMON_FUNDERS.has(key)) {
@@ -269,6 +293,8 @@ async function findFundingSource(addr: string): Promise<string> {
     }
   }
 
+  // Funder cannot be established within the 600 search cap
+  saveWalletIntelligence({ wallet_address: addr, funder_address: 'UNKNOWN' });
   return `ORIGIN_${addr}`;
 }
 
@@ -280,7 +306,7 @@ async function findFundingSource(addr: string): Promise<string> {
  * (not proof of same-entity control), used to avoid double-counting
  * convergence when a single actor funds multiple wallets.
  *
- * Known CEX/bridge funders are explicitly excluded from grouping.
+ * Known CEX/bridge funders and unknown funders are explicitly excluded from grouping.
  *
  * Returns:
  *   clusterCount     — number of distinct funding clusters (used as convergenceCount)
@@ -302,6 +328,12 @@ export async function detectWalletCluster(walletAddresses: string[]): Promise<{
     } catch {
       // On any RPC error, treat as independent origin
     }
+
+    // Wallets with unknown funding or origin are NOT grouped together
+    if (funderKey === 'UNKNOWN' || funderKey.startsWith('ORIGIN_')) {
+      funderKey = `ORIGIN_${addr}`;
+    }
+
     walletFunderMap.set(addr, funderKey);
     const group = clusterMap.get(funderKey) || [];
     group.push(addr);
@@ -318,11 +350,28 @@ export async function detectWalletCluster(walletAddresses: string[]): Promise<{
  * Analyzes the last N transactions of a wallet to assess whether they are
  * a profitable smart money trader. Checks win rate, avg profit, and avg hold time.
  * Returns null on any error (treated as inconclusive / pass).
+ * Caches results in SQLite to minimize Helius Free tier usage.
  */
 export async function assessWhaleCandidateWinRate(
   walletAddress: string,
   heliusApiKey: string
 ): Promise<{ winRate: number; avgHoldSec: number; totalTrades: number; passed: boolean; reason: string } | null> {
+  // ── Check SQLite Cache First (Zero Helius RPC if already analyzed) ──
+  const cached = getWalletIntelligence(walletAddress);
+  if (cached && cached.win_rate !== undefined && cached.win_rate !== null) {
+    const winRate = cached.win_rate;
+    const totalTrades = cached.total_trades || 0;
+    const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 55.0;
+    const passed = totalTrades < 5 || winRate >= minWinRate;
+    return {
+      winRate,
+      avgHoldSec: 9999,
+      totalTrades,
+      passed,
+      reason: `[Cache] Win Rate ${winRate.toFixed(1)}% (${passed ? '>=' : '<'} ${minWinRate}%)`
+    };
+  }
+
   try {
     // Use Helius Enhanced Transactions API for clean parsed tx data
     const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${heliusApiKey}&limit=20&type=SWAP`;
@@ -330,6 +379,7 @@ export async function assessWhaleCandidateWinRate(
     const txs: any[] = res.data || [];
 
     if (txs.length < 5) {
+      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: 100, total_trades: txs.length });
       return { winRate: 100, avgHoldSec: 9999, totalTrades: txs.length, passed: true, reason: 'Riwayat SWAP tidak cukup (< 5), dianggap bersih' };
     }
 
@@ -361,6 +411,7 @@ export async function assessWhaleCandidateWinRate(
 
     const totalTrades = wins + losses;
     if (totalTrades < 3) {
+      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: 100, total_trades: totalTrades });
       return { winRate: 100, avgHoldSec: 9999, totalTrades, passed: true, reason: 'Tidak cukup data swap SOL terukur, dianggap bersih' };
     }
 
@@ -382,6 +433,13 @@ export async function assessWhaleCandidateWinRate(
     const reason = passed
       ? `Win Rate ${winRate.toFixed(1)}% >= ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`
       : `Win Rate ${winRate.toFixed(1)}% < ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`;
+
+    // Persist to intelligence cache
+    saveWalletIntelligence({
+      wallet_address: walletAddress,
+      win_rate: winRate,
+      total_trades: totalTrades
+    });
 
     return { winRate, avgHoldSec, totalTrades, passed, reason };
   } catch (err: any) {
@@ -690,7 +748,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
       const market = await getTokenMarketData(tokenMint);
       const symbol = market ? market.symbol : 'TOKEN';
 
-      // ── PILAR 4: Deep scan 50 signatures per pool ──
+      // ── PILAR 4: Deep scan signatures per pool + establish canonical market clock ──
       let sigs: any[] = [];
       try {
         sigs = await connection.getSignaturesForAddress(new PublicKey(tokenMint), {
@@ -700,6 +758,11 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
         console.warn(`[WhaleScout PRO] Gagal ambil sigs untuk ${tokenMint}:`, err.message);
         continue;
       }
+
+      // Canonical market clock: oldest transaction in the scanned pool history
+      const oldestSigInfo = sigs.length > 0 ? sigs[sigs.length - 1] : null;
+      const firstPoolTradeBlockTime = oldestSigInfo?.blockTime || Math.floor(Date.now() / 1000);
+      const firstPoolTradeAt = new Date(firstPoolTradeBlockTime * 1000).toISOString();
 
       const candidateSeen = new Set<string>();
 
@@ -718,34 +781,76 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 
           if (!feePayerKey) continue;
           if (SYSTEM_BLACKLIST.has(feePayerKey)) continue;
-          if (isWhaleBlacklisted(feePayerKey)) continue;
-          if (getWhaleByAddress(feePayerKey)) continue;
-          if (candidateSeen.has(feePayerKey)) continue;
-          candidateSeen.add(feePayerKey);
 
           // Must be a net buyer
           const post = tx.meta.postTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
           const pre = tx.meta.preTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
           if ((parseFloat(post?.uiTokenAmount?.uiAmountString || '0')) <= (parseFloat(pre?.uiTokenAmount?.uiAmountString || '0'))) continue;
 
-          // ── Gate 1: SOL balance ──
-          const balanceLamports = await connection.getBalance(new PublicKey(feePayerKey));
-          const balanceSol = balanceLamports / 1_000_000_000;
-          if (balanceSol < CONFIG.MIN_WHALE_BALANCE_SOL) continue;
+          // ── Canonical Entry Age: wallet_entry_at - first_pool_trade_at ──
+          const walletEntryBlockTime = tx.blockTime || firstPoolTradeBlockTime;
+          const walletEntryAt = new Date(walletEntryBlockTime * 1000).toISOString();
+          const entryAgeSeconds = Math.max(0, walletEntryBlockTime - firstPoolTradeBlockTime);
 
-          // ── Gate 2: Buy size ──
           const preSol = tx.meta.preBalances[0] || 0;
           const postSol = tx.meta.postBalances[0] || 0;
-          const solSpent = (preSol - postSol) / 1_000_000_000;
-          if (solSpent < CONFIG.MIN_WHALE_BUY_SOL) continue;
+          const solSpent = Math.max(0, (preSol - postSol) / 1_000_000_000);
+
+          const poolAddress = market?.pairAddress || tokenMint;
+          const entryPriceUsd = market?.priceUsd || 0;
+          const entryMcUsd = market?.marketCap || market?.fdv || 0;
+          const entryLiquidityUsd = market?.liquidityUsd || 0;
+
+          // ── Phase 1 Event Ledger: Record discovery immediately (Preserves Denominator!) ──
+          recordEarlyEntryEvent({
+            wallet_address: feePayerKey,
+            token_mint: tokenMint,
+            pool_address: poolAddress,
+            first_pool_trade_at: firstPoolTradeAt,
+            wallet_entry_at: walletEntryAt,
+            entry_age_seconds: entryAgeSeconds,
+            entry_signature: sigInfo.signature,
+            entry_price_usd: entryPriceUsd,
+            entry_mc_usd: entryMcUsd,
+            entry_liquidity_usd: entryLiquidityUsd,
+            sol_spent: solSpent,
+            discovered_at: new Date().toISOString(),
+            status: 'DISCOVERED'
+          });
+
+          if (isWhaleBlacklisted(feePayerKey)) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
+            continue;
+          }
+          if (getWhaleByAddress(feePayerKey)) continue;
+          if (candidateSeen.has(feePayerKey)) continue;
+          candidateSeen.add(feePayerKey);
+
+          // ── Gate 1: SOL balance (Execution constraint, NOT proof of alpha) ──
+          const balanceLamports = await connection.getBalance(new PublicKey(feePayerKey));
+          const balanceSol = balanceLamports / 1_000_000_000;
+          if (balanceSol < CONFIG.MIN_WHALE_BALANCE_SOL) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
+            continue;
+          }
+
+          // ── Gate 2: Buy size ──
+          if (solSpent < CONFIG.MIN_WHALE_BUY_SOL) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
+            continue;
+          }
 
           // ── Gate 3: Anti-burner (tx history depth) ──
           const pastSigs = await connection.getSignaturesForAddress(new PublicKey(feePayerKey), { limit: 25 });
-          if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) continue;
+          if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
+            continue;
+          }
 
           // ── Gate 4: MEV / HFT bot filter ──
           const mevCheck = await isMevBotSuspect(feePayerKey, pastSigs);
           if (mevCheck.isMev) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
             console.log(`[WhaleScout PRO] 🤖 MEV: ${feePayerKey.slice(0, 8)} — ${mevCheck.reason}`);
             continue;
           }
@@ -753,17 +858,19 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           // ── Gate 5: Cabal / Sybil cluster ──
           const cabalCheck = await isCabalSuspect(feePayerKey, getAllWhales());
           if (cabalCheck.isCabal) {
+            updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
             console.log(`[WhaleScout PRO] 🚨 CABAL: ${feePayerKey.slice(0, 8)} — shared funder: ${cabalCheck.matchingWhales.join(', ')}`);
             continue;
           }
 
-          // ── Gate 6: Historical win rate pre-screen ──
+          // ── Gate 6: Historical win rate pre-screen (Helius with SQLite Cache) ──
           let winRate = 60; // default assumption if Helius unavailable
           let totalTrades = 0;
           if (heliusApiKey) {
             const wr = await assessWhaleCandidateWinRate(feePayerKey, heliusApiKey);
             if (wr !== null) {
               if (!wr.passed && wr.totalTrades >= 5) {
+                updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
                 console.log(`[WhaleScout PRO] 📉 WR FAIL: ${feePayerKey.slice(0, 8)} — ${wr.reason}`);
                 continue;
               }
@@ -772,11 +879,19 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
             }
           }
 
-          // ── All 6 Gates Passed: Add to convergence map ──
+          // ── All 6 Gates Passed: Mark QUALIFIED & OUTCOME_PENDING ──
+          updateEarlyEntryStatus(sigInfo.signature, 'OUTCOME_PENDING');
+
+          // Retrieve cross-token recurrence metrics from persistent event ledger
+          const recurrence = getWalletRecurrenceMetrics(feePayerKey);
+
           let archetype = '🎯 RAYDIUM_HUNTER';
           let label = `🎯 Scout: $${symbol} Smart Buyer`;
 
-          if (balanceSol >= CONFIG.VIP_WHALE_BALANCE_SOL) {
+          if (recurrence.total_early_entries >= 4 && recurrence.hit_rate >= 60 && recurrence.avg_entry_age_seconds < 300) {
+            archetype = '🔁 RECURRENT_EARLY_MOVER';
+            label = `🔁 Recurrent: $${symbol} Proven Early Mover`;
+          } else if (balanceSol >= CONFIG.VIP_WHALE_BALANCE_SOL) {
             archetype = '👑 VIP_ACCUMULATOR_CANDIDATE';
             label = `👑 Paus: $${symbol} VIP Accumulator`;
           } else if (isMigration) {
@@ -799,14 +914,20 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
             winRate,
             totalTrades,
             pastTxCount: pastSigs.length,
-            isMigrationInsider: isMigration
+            isMigrationInsider: isMigration,
+            entryAgeSeconds,
+            entrySignature: sigInfo.signature,
+            recurrence
           };
 
           const existing = tokenSmartMoneyMap.get(tokenMint) || [];
           existing.push(candidate);
           tokenSmartMoneyMap.set(tokenMint, existing);
 
-          console.log(`[WhaleScout PRO] ✅ LOLOS 6-GATE: ${feePayerKey.slice(0,8)} → ${archetype} | WR:${winRate.toFixed(0)}% | ${solSpent.toFixed(3)} SOL spent | Convergence[${tokenMint.slice(0,6)}]: ${existing.length}`);
+          const recLog = recurrence.total_early_entries > 1
+            ? ` | Recurrence: ${recurrence.total_early_entries} tokens (HR: ${recurrence.hit_rate.toFixed(0)}%)`
+            : '';
+          console.log(`[WhaleScout PRO] ✅ LOLOS 6-GATE: ${feePayerKey.slice(0,8)} → ${archetype} | WR:${winRate.toFixed(0)}% | ${solSpent.toFixed(3)} SOL spent | Age:${entryAgeSeconds}s${recLog} | Convergence[${tokenMint.slice(0,6)}]: ${existing.length}`);
         } catch {
           // ignore individual tx parse errors
         }
@@ -840,7 +961,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
             c.funderAddress = clusterResult.walletFunderMap.get(c.address);
           }
           if (clusterCount < candidates.length) {
-            console.log(`[WhaleScout PRO] 🔗 CLUSTER DETECTED [${tokenItem.tokenMint.slice(0,6)}]: ${candidates.length} wallet → ${clusterCount} entitas independen (${candidates.length - clusterCount} wallet dikonfirmasi 1 cluster)`);
+            console.log(`[WhaleScout PRO] 🔗 CLUSTER DETECTED [${tokenItem.tokenMint.slice(0,6)}]: ${candidates.length} wallet → ${clusterCount} funding cluster (${candidates.length - clusterCount} wallet berbagi funder)`);
           }
         } catch {
           // On cluster detection failure, fall back to raw wallet count
@@ -859,7 +980,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
       const { score, tier, convergenceCount, rawWalletCount, avgWinRate } = t.smsResult;
       const symbol = (await getTokenMarketData(t.tokenMint))?.symbol || 'TOKEN';
       const clusterNote = rawWalletCount > convergenceCount
-        ? `${convergenceCount} entitas / ${rawWalletCount} wallet`
+        ? `${convergenceCount} cluster / ${rawWalletCount} wallet`
         : `${convergenceCount} wallet`;
       console.log(`[WhaleScout PRO]   ${tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬'} ${symbol}: SMS ${score}/100 (Konvergensi: ${clusterNote}, Avg WR: ${avgWinRate.toFixed(0)}%) [${tier}]`);
     }
@@ -875,16 +996,17 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
       const isMigration = tokenItem.poolName.includes('Raydium Migration') || tokenItem.poolName.includes('Raydium New');
       const isBirdeye = tokenItem.poolName.includes('Birdeye');
 
-      // For WEAK signals with only 1 unscreened wallet, still recruit but mark PROBATION strictly
       const tierEmoji = tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬';
       const sourceTag = isMigration ? '🚀 *Raydium Migration*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
 
-      // Build cluster label: show funding-cluster deduplication result
-      // NOTE: "funding cluster" = heuristic grouping by shared funder, NOT proof of same identity.
-      // Wallets from known exchanges (same CEX funder) are never grouped.
+      // Build cluster label using strict terminology: "funding cluster", NOT "independent entity"
       const clusterLabel = rawWalletCount > convergenceCount
         ? `*${convergenceCount} funding cluster* (${rawWalletCount} wallet terdeteksi, ${rawWalletCount - convergenceCount} wallet berbagi funder yang sama)`
-        : `*${convergenceCount} wallet* (funder berbeda / tidak terdeteksi satu asal)`;
+        : `*${convergenceCount} funding cluster* (${rawWalletCount} wallet terdeteksi)`;
+
+      const recurrenceSummary = bestCandidate.recurrence && bestCandidate.recurrence.total_early_entries > 1
+        ? `\n🔁 *Cross-Token Recurrence:* *${bestCandidate.recurrence.total_early_entries} token* (${bestCandidate.recurrence.successful_entries}W / ${bestCandidate.recurrence.failed_entries}L, Hit Rate: *${bestCandidate.recurrence.hit_rate.toFixed(0)}%*, Avg Age: *${bestCandidate.recurrence.avg_entry_age_seconds.toFixed(0)}s*)`
+        : '';
 
       // Send convergence alert if multiple funding clusters detected
       if (convergenceCount >= 2) {
@@ -897,7 +1019,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
           `🧠 *Smart Money Score:* *${score}/100* [*${tier}*]
 ` +
-          `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
+          `_⚠️ SMS adalah ranking konvergensi internal — bukan probabilitas harga naik._
 ` +
           `🔗 *Funding Cluster Terdeteksi:* ${clusterLabel}
 ` +
@@ -905,7 +1027,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
           `📈 *Rata-rata Win Rate:* *${avgWinRate.toFixed(1)}%*
 ` +
-          `🏆 *Wallet Terbaik:* \`${bestCandidate.address.slice(0,8)}...\` (WR: ${bestCandidate.winRate.toFixed(0)}%, beli ${bestCandidate.solSpent.toFixed(2)} SOL)
+          `🏆 *Wallet Terbaik:* \`${bestCandidate.address.slice(0,8)}...\` (WR: ${bestCandidate.winRate.toFixed(0)}%, beli ${bestCandidate.solSpent.toFixed(2)} SOL)${recurrenceSummary}
 
 ` +
           `_Bot merekrut wallet dengan score terbaik dari kluster ini sebagai signal anchor._`;
@@ -935,7 +1057,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📊 *Win Rate Historical:* *${bestCandidate.winRate.toFixed(0)}%* (${bestCandidate.totalTrades} swaps)
 ` +
-            `🔗 *Funding Cluster:* ${clusterLabel}
+            `🔗 *Funding Cluster:* ${clusterLabel}${recurrenceSummary}
 ` +
             `💸 *Total SOL Kelompok:* *${totalSolEntered.toFixed(2)} SOL*
 ` +
@@ -945,7 +1067,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `🛡️ *Status Copy:* *OFF (Shadow Track)*
 ` +
-            `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
+            `_⚠️ SMS adalah ranking konvergensi internal — bukan probabilitas harga naik._
 
 ` +
             `_💡 Bot memantau ${convergenceCount} funding cluster berbeda di token ini secara real-time._`;
@@ -978,9 +1100,9 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📝 *Alamat:* \`${feePayerKey}\`
 ` +
-            `🔗 *Funding Cluster:* ${clusterLabel}
+            `🔗 *Funding Cluster:* ${clusterLabel}${recurrenceSummary}
 ` +
-            `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
+            `_⚠️ SMS adalah ranking konvergensi internal — bukan probabilitas harga naik._
 ` +
             `💰 *Saldo:* *${bestCandidate.balanceSol.toFixed(2)} SOL*
 ` +
