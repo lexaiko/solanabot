@@ -69,6 +69,7 @@ export interface SmartMoneyCandidate {
   totalTrades: number;       // Number of historical trades audited
   pastTxCount: number;       // Total historical tx count on-chain
   isMigrationInsider: boolean;
+  funderAddress?: string;    // Detected funding source wallet (for cluster deduplication)
 }
 
 /**
@@ -91,27 +92,31 @@ const tokenSmartMoneyMap: Map<string, SmartMoneyCandidate[]> = new Map();
  *   >= 50 : ⚡ STRONG SIGNAL (single elite wallet, or 2 moderate)
  *   < 50  : 🔬 WEAK SIGNAL (observe only)
  */
-export function computeSmartMoneyScore(candidates: SmartMoneyCandidate[]): {
+export function computeSmartMoneyScore(candidates: SmartMoneyCandidate[], clusterCount?: number): {
   score: number;
   tier: 'CONVICTION' | 'STRONG' | 'WEAK';
-  convergenceCount: number;
+  convergenceCount: number;   // = clusterCount (independent economic entities)
+  rawWalletCount: number;     // raw wallet count before cluster dedup
   avgWinRate: number;
   totalSolEntered: number;
   bestCandidate: SmartMoneyCandidate;
 } {
-  const convergenceCount = candidates.length;
+  const rawWalletCount = candidates.length;
+  // Use cluster-deduplicated count if provided; else fall back to raw count
+  const convergenceCount = clusterCount !== undefined ? clusterCount : rawWalletCount;
 
   // Weighted win rate: weight by SOL size of each buy (bigger buyer's WR matters more)
   const totalSol = candidates.reduce((s, c) => s + c.solSpent, 0);
   const weightedWinRate = totalSol > 0
     ? candidates.reduce((s, c) => s + (c.winRate * c.solSpent), 0) / totalSol
-    : candidates.reduce((s, c) => s + c.winRate, 0) / convergenceCount;
+    : candidates.reduce((s, c) => s + c.winRate, 0) / rawWalletCount;
 
   // Migration insider bonus: wallets that bought during initial pool minutes are highest quality
   const migrationCount = candidates.filter(c => c.isMigrationInsider).length;
   const migrationBonus = 1.0 + (migrationCount * 0.15); // +15% per insider
 
-  // Score formula: convergence ^ 1.5 × avgWR × migrationBonus / 10 (normalize to 0-100)
+  // Score formula: clusterCount ^ 1.5 × avgWR × migrationBonus / 10 (normalize to 0-100)
+  // NOTE: convergenceCount here = independent cluster count, not raw wallet count.
   const rawScore = (Math.pow(convergenceCount, 1.5) * weightedWinRate * migrationBonus) / 10;
   const score = Math.min(100, Math.round(rawScore));
 
@@ -124,7 +129,7 @@ export function computeSmartMoneyScore(candidates: SmartMoneyCandidate[]): {
     (b.winRate * b.solSpent) - (a.winRate * a.solSpent)
   )[0];
 
-  return { score, tier, convergenceCount, avgWinRate: weightedWinRate, totalSolEntered: totalSol, bestCandidate };
+  return { score, tier, convergenceCount, rawWalletCount, avgWinRate: weightedWinRate, totalSolEntered: totalSol, bestCandidate };
 }
 
 /**
@@ -159,6 +164,87 @@ export async function isMevBotSuspect(walletAddress: string, signatures: any[]):
   }
 
   return { isMev: false, reason: 'Human smart money profile' };
+}
+
+// ============================================================================
+// WALLET CLUSTER DETECTION — Independent Conviction Deduplication
+// ============================================================================
+/**
+ * Detects whether a set of wallet addresses share a common funding source.
+ * Wallets funded by the same originator wallet are treated as ONE economic entity,
+ * preventing a single actor controlling multiple wallets from inflating convergenceCount.
+ *
+ * Method: For each wallet, fetch its oldest on-chain transaction and find the
+ * first SOL transfer *into* the wallet. That sender = funding source.
+ * Wallets sharing the same funder are grouped into one cluster.
+ *
+ * Returns:
+ *   clusterCount  — number of truly independent funding sources
+ *   clusterMap    — Map<funderAddress, walletAddress[]> for logging
+ */
+export async function detectWalletCluster(walletAddresses: string[]): Promise<{
+  clusterCount: number;
+  clusterMap: Map<string, string[]>;
+  walletFunderMap: Map<string, string>;  // wallet → funder
+}> {
+  const clusterMap = new Map<string, string[]>();
+  const walletFunderMap = new Map<string, string>();
+
+  for (const addr of walletAddresses) {
+    let funderKey = `ORIGIN_${addr}`; // default: treat as independent if no funder found
+    try {
+      // Fetch oldest signatures (reverse order = oldest first with before param)
+      const sigs = await connection.getSignaturesForAddress(
+        new PublicKey(addr),
+        { limit: 200 },
+        'confirmed'
+      );
+      if (sigs.length === 0) {
+        walletFunderMap.set(addr, funderKey);
+        const g = clusterMap.get(funderKey) || [];
+        g.push(addr);
+        clusterMap.set(funderKey, g);
+        continue;
+      }
+
+      // Oldest transaction = last element in array (getSignaturesForAddress returns newest-first)
+      const oldestSig = sigs[sigs.length - 1].signature;
+      const parsedTx = await connection.getParsedTransaction(oldestSig, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed'
+      });
+
+      if (parsedTx?.meta?.preBalances && parsedTx?.meta?.postBalances) {
+        const accountKeys = parsedTx.transaction.message.accountKeys;
+        // Find any account that sent SOL to this wallet in the oldest tx
+        for (let i = 0; i < accountKeys.length; i++) {
+          const key = accountKeys[i].pubkey.toBase58();
+          if (key === addr) continue;
+          if (SYSTEM_BLACKLIST.has(key)) continue;
+          const preBal = parsedTx.meta.preBalances[i] || 0;
+          const postBal = parsedTx.meta.postBalances[i] || 0;
+          // This account's balance decreased (it sent SOL to our wallet)
+          if (preBal > postBal && (preBal - postBal) > 5_000_000) { // > 0.005 SOL sent
+            funderKey = key;
+            break;
+          }
+        }
+      }
+    } catch {
+      // On error, treat as independent origin
+    }
+
+    walletFunderMap.set(addr, funderKey);
+    const group = clusterMap.get(funderKey) || [];
+    group.push(addr);
+    clusterMap.set(funderKey, group);
+  }
+
+  return {
+    clusterCount: clusterMap.size,
+    clusterMap,
+    walletFunderMap
+  };
 }
 
 // ============================================================================
@@ -664,18 +750,41 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
     }
 
     // ── PHASE 2: Score & rank tokens by Smart Money Convergence ──
-    // Sort tokens by SMS score descending — recruit from highest conviction first.
+    // Before scoring, run Wallet Cluster Detection to ensure convergenceCount reflects
+    // true independent economic entities — not wallets controlled by the same actor.
     const scoredTokens: Array<{
       tokenMint: string;
       tokenItem: typeof targetTokens[0];
       smsResult: ReturnType<typeof computeSmartMoneyScore>;
+      clusterMap: Map<string, string[]>;
     }> = [];
 
     for (const tokenItem of targetTokens) {
       const candidates = tokenSmartMoneyMap.get(tokenItem.tokenMint);
       if (!candidates || candidates.length === 0) continue;
-      const smsResult = computeSmartMoneyScore(candidates);
-      scoredTokens.push({ tokenMint: tokenItem.tokenMint, tokenItem, smsResult });
+
+      // Cluster detection: only run when multiple wallets found (lazy evaluation)
+      let clusterCount = candidates.length;
+      let clusterMap = new Map<string, string[]>();
+      if (candidates.length >= 2) {
+        try {
+          const clusterResult = await detectWalletCluster(candidates.map(c => c.address));
+          clusterCount = clusterResult.clusterCount;
+          clusterMap = clusterResult.clusterMap;
+          // Annotate each candidate with its detected funder
+          for (const c of candidates) {
+            c.funderAddress = clusterResult.walletFunderMap.get(c.address);
+          }
+          if (clusterCount < candidates.length) {
+            console.log(`[WhaleScout PRO] 🔗 CLUSTER DETECTED [${tokenItem.tokenMint.slice(0,6)}]: ${candidates.length} wallet → ${clusterCount} entitas independen (${candidates.length - clusterCount} wallet dikonfirmasi 1 cluster)`);
+          }
+        } catch {
+          // On cluster detection failure, fall back to raw wallet count
+        }
+      }
+
+      const smsResult = computeSmartMoneyScore(candidates, clusterCount);
+      scoredTokens.push({ tokenMint: tokenItem.tokenMint, tokenItem, smsResult, clusterMap });
     }
 
     // Sort by score descending
@@ -683,16 +792,19 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 
     console.log(`[WhaleScout PRO] 📊 Phase 2 SMS Scoring: ${scoredTokens.length} token dengan qualified wallets.`);
     for (const t of scoredTokens) {
-      const { score, tier, convergenceCount, avgWinRate } = t.smsResult;
+      const { score, tier, convergenceCount, rawWalletCount, avgWinRate } = t.smsResult;
       const symbol = (await getTokenMarketData(t.tokenMint))?.symbol || 'TOKEN';
-      console.log(`[WhaleScout PRO]   ${tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬'} ${symbol}: SMS ${score}/100 (Conv: ${convergenceCount} wallets, Avg WR: ${avgWinRate.toFixed(0)}%) [${tier}]`);
+      const clusterNote = rawWalletCount > convergenceCount
+        ? `${convergenceCount} entitas / ${rawWalletCount} wallet`
+        : `${convergenceCount} wallet`;
+      console.log(`[WhaleScout PRO]   ${tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬'} ${symbol}: SMS ${score}/100 (Konvergensi: ${clusterNote}, Avg WR: ${avgWinRate.toFixed(0)}%) [${tier}]`);
     }
 
     // ── PHASE 3: Recruit from highest-conviction tokens ──
-    for (const { tokenMint, tokenItem, smsResult } of scoredTokens) {
+    for (const { tokenMint, tokenItem, smsResult, clusterMap } of scoredTokens) {
       if ((recruitedCount + queuedCount) >= limitToRecruit) break;
 
-      const { score, tier, convergenceCount, avgWinRate, totalSolEntered, bestCandidate } = smsResult;
+      const { score, tier, convergenceCount, rawWalletCount, avgWinRate, totalSolEntered, bestCandidate } = smsResult;
       const candidates = tokenSmartMoneyMap.get(tokenMint)!;
       const market = await getTokenMarketData(tokenMint);
       const symbol = market?.symbol || 'TOKEN';
@@ -703,7 +815,12 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
       const tierEmoji = tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬';
       const sourceTag = isMigration ? '🚀 *Raydium Migration*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
 
-      // Send convergence alert if multiple wallets detected
+      // Build cluster label: show deduplication result if applicable
+      const clusterLabel = rawWalletCount > convergenceCount
+        ? `*${convergenceCount} entitas independen* (${rawWalletCount} wallet, ${rawWalletCount - convergenceCount} terkonfirmasi 1 cluster)`
+        : `*${convergenceCount} wallet independen*`;
+
+      // Send convergence alert if multiple independent entities detected
       if (convergenceCount >= 2) {
         const convMsg = `${tierEmoji} *KONVERGENSI SMART MONEY TERDETEKSI!* ${tier === 'CONVICTION' ? '🔥' : ''}
 
@@ -714,7 +831,9 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
           `🧠 *Smart Money Score:* *${score}/100* [*${tier}*]
 ` +
-          `👥 *Jumlah Smart Wallet Masuk:* *${convergenceCount} wallet independen*
+          `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
+` +
+          `👥 *Smart Wallet Masuk:* ${clusterLabel}
 ` +
           `💰 *Total SOL Masuk:* *${totalSolEntered.toFixed(2)} SOL*
 ` +
@@ -735,7 +854,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 
         if (added) {
           recruitedCount++;
-          console.log(`[WhaleScout PRO] 🎯 DIREKRUT (SMS ${score}/100 [${tier}]): ${bestCandidate.label} | Conv:${convergenceCount} | AvgWR:${avgWinRate.toFixed(0)}%`);
+          console.log(`[WhaleScout PRO] 🎯 DIREKRUT (SMS ${score}/100 [${tier}]): ${bestCandidate.label} | Cluster:${convergenceCount}/${rawWalletCount} | AvgWR:${avgWinRate.toFixed(0)}%`);
 
           const recruitMsg = `🏛️ *SMART MONEY DIREKRUT (SMS SCORE: ${score}/100 [${tier}])* ✅
 
@@ -750,7 +869,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📊 *Win Rate Historical:* *${bestCandidate.winRate.toFixed(0)}%* (${bestCandidate.totalTrades} swaps)
 ` +
-            `👥 *Konvergensi:* *${convergenceCount} smart wallet* masuk token yang sama
+            `👥 *Konvergensi:* ${clusterLabel}
 ` +
             `💸 *Total SOL Kelompok:* *${totalSolEntered.toFixed(2)} SOL*
 ` +
@@ -759,9 +878,11 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
             `🪙 *Pool Acuan:* ${sourceTag} — *$${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)
 ` +
             `🛡️ *Status Copy:* *OFF (Shadow Track)*
+` +
+            `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
 
 ` +
-            `_💡 Bot memantau konvergensi ${convergenceCount} trader berhistoris kuat di token ini secara real-time._`;
+            `_💡 Bot memantau konvergensi ${convergenceCount} entitas independen di token ini secara real-time._`;
 
           await notify(recruitMsg);
         }
@@ -791,7 +912,9 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📝 *Alamat:* \`${feePayerKey}\`
 ` +
-            `🧠 *SMS Score:* *${score}/100* [${tier}] | Conv: *${convergenceCount} wallet*
+            `🧠 *SMS Score:* *${score}/100* [${tier}] | Konvergensi: ${clusterLabel}
+` +
+            `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
 ` +
             `💰 *Saldo:* *${bestCandidate.balanceSol.toFixed(2)} SOL*
 ` +
