@@ -161,6 +161,21 @@ export async function executeBuyToken(
     } catch {}
   }
 
+  // Construct Transparent Source & Whale Context Section for Notifications
+  const whaleInfoSection = whale ? (
+    `🐋 *Pemicu Order:* *${whale.label}*\n` +
+    `👛 *Dompet Paus:* \`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`\n` +
+    (whaleSolAmount && whaleSolAmount > 0 
+      ? `💵 *Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL* (~$${(whaleSolAmount * solPriceUsd).toFixed(0)})\n` 
+      : '') +
+    (whaleEntryPriceUsd && whaleEntryPriceUsd > 0 
+      ? `🎯 *Harga Beli Paus:* *${formatPrice(whaleEntryPriceUsd)}*\n` 
+      : '') +
+    `\n`
+  ) : (
+    (source && source !== 'MANUAL') ? `🏷️ *Pemicu Order:* ${source}\n\n` : ''
+  );
+
   // Institutional Risk Control 1.5: Narrative / Sector Concentration Shield
   const currentNarrative = extractNarrative(marketData.symbol, marketData.name);
   if (currentNarrative !== 'OTHER') {
@@ -168,7 +183,13 @@ export async function executeBuyToken(
     if (matchingPositions.length >= CONFIG.MAX_POSITIONS_PER_NARRATIVE) {
       console.log(`[AutoTrade] 🛡️ Narrative Shield: Sudah ada ${matchingPositions.length} posisi di sektor ${currentNarrative}. Menolak order untuk mencegah correlated risk.`);
       if (shouldNotifyFilterSkip) {
-        await notify(`⚠️ *ORDER DIBATALKAN: NARRATIVE SHIELD*\n\nPortofolio sudah memiliki ${matchingPositions.length} koin di sektor *${currentNarrative}* (${matchingPositions.map(p => p.token_symbol).join(', ')}). Bot mencegah risiko kerugian terkorelasi.`);
+        await notify(
+          `⚠️ *ORDER DIBATALKAN: NARRATIVE SHIELD*\n\n` +
+          `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+          `📝 *CA:* \`${tokenMint}\`\n\n` +
+          whaleInfoSection +
+          `🛡️ *Alasan:* Portofolio sudah memiliki ${matchingPositions.length} koin di sektor *${currentNarrative}* (${matchingPositions.map(p => p.token_symbol).join(', ')}). Bot mencegah risiko kerugian terkorelasi.`
+        );
       }
       return { success: false, message: `Maksimal posisi sektor ${currentNarrative} tercapai` };
     }
@@ -185,7 +206,9 @@ export async function executeBuyToken(
     console.log(`[AutoTrade] 🛡️ Ditolak: Likuiditas $${effectiveLiquidity.toFixed(0)} < $${CONFIG.MIN_LIQUIDITY_USD} (${marketData.symbol})`);
     if (shouldNotifyFilterSkip) {
       const alertMsg = `⚠️ *ORDER DIBATALKAN: LIKUIDITAS TERLALU RENDAH*\n\n` +
-        `🪙 *Token:* ${marketData.symbol} (${marketData.name})\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
         `💧 *Likuiditas Pool:* *$${formatNumber(effectiveLiquidity)}* (Syarat Min: *$${formatNumber(CONFIG.MIN_LIQUIDITY_USD)}*)\n\n` +
         `_Bot menolak membeli di pool illiquid untuk mencegah jebakan slippage dan price impact raksasa._`;
       await notify(alertMsg);
@@ -193,19 +216,15 @@ export async function executeBuyToken(
     return { success: false, message: 'Likuiditas pool di bawah standar minimum' };
   }
 
-  const whaleLabel = whale ? `\n🐋 *Sumber Paus:* ${whale.label}` : '';
-  const whaleVol = (whaleSolAmount && whaleSolAmount > 0)
-    ? `\n💵 *Volume Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL* (~$${(whaleSolAmount * solPriceUsd).toFixed(0)})`
-    : '';
-
   // Institutional Risk Control 2b: Minimum 24h Volume Floor (Active Market Depth)
   if (marketData.volume24h !== undefined && marketData.volume24h > 0 && marketData.volume24h < CONFIG.MIN_VOLUME_24H_USD) {
     console.log(`[AutoTrade] 🛡️ Ditolak: Volume 24j $${marketData.volume24h.toFixed(0)} < $${CONFIG.MIN_VOLUME_24H_USD} (${marketData.symbol})`);
     if (shouldNotifyFilterSkip) {
       const alertMsg = `⚠️ *ORDER DIBATALKAN: VOLUME 24J TERLALU RENDAH*\n\n` +
-        `🪙 *Token:* ${marketData.symbol} (${marketData.name})\n` +
-        `📊 *Volume 24 Jam:* *$${formatNumber(marketData.volume24h)}* (Syarat Min: *$${formatNumber(CONFIG.MIN_VOLUME_24H_USD)}*)\n` +
-        `${whaleLabel}${whaleVol}\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
+        `📊 *Volume 24 Jam:* *$${formatNumber(marketData.volume24h)}* (Syarat Min: *$${formatNumber(CONFIG.MIN_VOLUME_24H_USD)}*)\n\n` +
         `_Bot menolak token sepi transaksi untuk menghindari risiko token mati / zombie memecoin._`;
       await notify(alertMsg);
     }
@@ -215,14 +234,11 @@ export async function executeBuyToken(
   if (marketData.marketCap < CONFIG.MIN_MARKET_CAP_USD) {
     console.log(`[AutoTrade] 🛡️ Ditolak: MC $${marketData.marketCap.toFixed(0)} < $${CONFIG.MIN_MARKET_CAP_USD} (${marketData.symbol})`);
     if (shouldNotifyFilterSkip) {
-      const whaleLabel = whale ? `\n🐋 *Sumber Paus:* ${whale.label}` : '';
-      const whaleVol = (whaleSolAmount && whaleSolAmount > 0)
-        ? `\n💵 *Volume Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL* (~$${(whaleSolAmount * solPriceUsd).toFixed(0)})`
-        : '';
       const alertMsg = `⚠️ *ORDER DIBATALKAN: MARKET CAP TERLALU KECIL*\n\n` +
-        `🪙 *Token:* ${marketData.symbol} (${marketData.name})\n` +
-        `📊 *Market Cap:* *$${formatNumber(marketData.marketCap)}* (Syarat Min: *$${formatNumber(CONFIG.MIN_MARKET_CAP_USD)}*)\n` +
-        `${whaleLabel}${whaleVol}\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
+        `📊 *Market Cap:* *$${formatNumber(marketData.marketCap)}* (Syarat Min: *$${formatNumber(CONFIG.MIN_MARKET_CAP_USD)}*)\n\n` +
         `_Bot menolak token kapitalisasi mikro dengan risiko manipulasi dev tinggi._`;
       await notify(alertMsg);
     }
@@ -235,14 +251,10 @@ export async function executeBuyToken(
     if (driftPct > CONFIG.MAX_PRICE_DRIFT_PCT) {
       console.log(`[AutoTrade] 🛡️ Anti-Chase triggered: drift +${driftPct.toFixed(1)}% > ${CONFIG.MAX_PRICE_DRIFT_PCT}% (${marketData.symbol})`);
       if (shouldNotifyFilterSkip) {
-        const whaleLabel = whale ? `\n🐋 *Sumber Paus:* ${whale.label}` : '';
-        const whaleVol = (whaleSolAmount && whaleSolAmount > 0)
-          ? `\n💵 *Volume Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL* (~$${(whaleSolAmount * solPriceUsd).toFixed(0)})`
-          : '';
         const alertMsg = `⚠️ *ORDER DIBATALKAN: ANTI-CHASE GUARD (Pucuk Guard)*\n\n` +
-          `🪙 *Token:* ${marketData.symbol}\n` +
-          `${whaleLabel}${whaleVol}\n` +
-          `🐋 *Entry Paus:* *${formatPrice(whaleEntryPriceUsd)}*\n` +
+          `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+          `📝 *CA:* \`${tokenMint}\`\n\n` +
+          whaleInfoSection +
           `📈 *Harga Pasar Sekarang:* *${formatPrice(marketData.priceUsd)}* (+${driftPct.toFixed(1)}% dari paus)\n` +
           `🛡️ *Batas Toleransi Drift:* *+${CONFIG.MAX_PRICE_DRIFT_PCT}%*\n\n` +
           `_Bot menolak mengejar koin yang sudah terlanjur melambung tinggi agar modal Anda tidak menjadi exit liquidity!_`;
@@ -256,13 +268,10 @@ export async function executeBuyToken(
   if (marketData.priceChange5m && marketData.priceChange5m > CONFIG.MAX_5M_PRICE_CHANGE_PCT) {
     console.log(`[AutoTrade] 🛡️ Anti-FOMO triggered: 5m change +${marketData.priceChange5m.toFixed(1)}% (${marketData.symbol})`);
     if (shouldNotifyFilterSkip) {
-      const whaleLabel = whale ? `\n🐋 *Sumber Paus:* ${whale.label}` : '';
-      const whaleVol = (whaleSolAmount && whaleSolAmount > 0)
-        ? `\n💵 *Volume Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL* (~$${(whaleSolAmount * solPriceUsd).toFixed(0)})`
-        : '';
       const alertMsg = `⚠️ *ORDER DIBATALKAN: ANTI-FOMO SPIKE GUARD*\n\n` +
-        `🪙 *Token:* ${marketData.symbol}\n` +
-        `${whaleLabel}${whaleVol}\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
         `⚡ *Lonjakan 5 Menit:* *+${marketData.priceChange5m.toFixed(1)}%* (Batas Maksimal: +${CONFIG.MAX_5M_PRICE_CHANGE_PCT}%)\n\n` +
         `_Bot mendeteksi candle parabola vertikal yang rawan aksi dump instan._`;
       await notify(alertMsg);
@@ -275,14 +284,11 @@ export async function executeBuyToken(
     console.log(`[AutoTrade] 🛡️ Anti-Rug failed for ${marketData.symbol}: score ${safety.score}/100, risks: ${safety.risks.join(', ')}`);
     if (shouldNotifyFilterSkip) {
       const riskDetails = safety.risks.map(r => `• ${r}`).join('\n');
-      const whaleLabel = whale ? `\n🐋 *Sumber Paus:* ${whale.label}` : '';
-      const whaleVol = (whaleSolAmount && whaleSolAmount > 0)
-        ? `\n💵 *Volume Beli Paus:* *${whaleSolAmount.toFixed(2)} SOL*`
-        : '';
       const alertMsg = `🛡️ *ORDER DIBATALKAN: ANTI-RUG GUARD*\n\n` +
-        `🪙 *Token:* ${marketData.symbol} (${marketData.name})\n` +
-        `📊 *Skor Keamanan:* *${safety.score}/100* (Di bawah standar aman)\n` +
-        `${whaleLabel}${whaleVol}\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
+        `📊 *Skor Keamanan:* *${safety.score}/100* (Di bawah standar aman)\n\n` +
         `🚨 *Indikasi Bahaya:*\n${riskDetails}\n\n` +
         `_Bot melindungi modal Anda dari token berisiko tinggi atau jebakan dev._`;
       await notify(alertMsg);
