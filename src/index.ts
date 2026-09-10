@@ -64,7 +64,7 @@ async function main() {
         } catch {}
       }
 
-      await executeBuyToken(tokenMint, positionSizeSol, 'COPY_TRADE', currentWhale, whaleEntryPriceUsd, market || undefined);
+      await executeBuyToken(tokenMint, positionSizeSol, 'COPY_TRADE', currentWhale, whaleEntryPriceUsd, market || undefined, solAmount);
     } else if (action === 'SELL') {
       console.log(`[AutoTrade] 🚨 Whale Sell Event: [${currentWhale.tier || 'VERIFIED'}] ${currentWhale.label} dumped token ${tokenMint} (${tokenAmount || 0} tokens)`);
 
