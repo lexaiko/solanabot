@@ -119,10 +119,10 @@ export async function executeBuyToken(
     return { success: false, message: 'Maksimal posisi aktif portofolio tercapai' };
   }
 
-  // Check paper balance
+  // Check paper balance baseline
   const currentBalance = getPaperBalance();
-  if (currentBalance < amountSol) {
-    const msg = `⚠️ Saldo tidak cukup! Saldo: ${currentBalance.toFixed(3)} SOL, Diperlukan: ${amountSol.toFixed(3)} SOL`;
+  if (currentBalance <= 0.005) {
+    const msg = `⚠️ Saldo paper trading habis! Saldo: ${currentBalance.toFixed(3)} SOL`;
     if (shouldNotifyFilterSkip) {
       await notify(msg);
     }
@@ -296,22 +296,50 @@ export async function executeBuyToken(
     return { success: false, message: `Skor keamanan terlalu rendah: ${safety.score}/100` };
   }
 
+  // 2.5 Quantitative Capital Allocation: Fractional Kelly Criterion + Liquidity Depth Cap
+  // Executed strictly AFTER all institutional safety, liquidity, and volume filters pass!
+  let buyAmountSol = amountSol;
+  if (isCopyTrade && whale) {
+    const { calculateKellyPositionSize } = await import('./kellyEngine');
+    const kellyResult = calculateKellyPositionSize(
+      whale,
+      effectiveLiquidity,
+      solPriceUsd,
+      currentBalance,
+      marketData.priceChange5m || 0
+    );
+    buyAmountSol = kellyResult.allocatedSol;
+    console.log(`[AutoTrade] ⚡ Kelly Sizing Active for [${whale.tier}] ${whale.label}: ${buyAmountSol} SOL (${kellyResult.rationale})`);
+  } else if (!buyAmountSol || buyAmountSol <= 0) {
+    buyAmountSol = CONFIG.DEFAULT_BUY_AMOUNT_SOL;
+  }
+
+  // Final balance validation against actual allocated position size
+  if (currentBalance < buyAmountSol) {
+    const msg = `⚠️ Saldo tidak cukup! Saldo: ${currentBalance.toFixed(3)} SOL, Diperlukan: ${buyAmountSol.toFixed(3)} SOL`;
+    console.log(`[AutoTrade] 🛡️ Ditolak: ${msg}`);
+    if (shouldNotifyFilterSkip) {
+      await notify(msg);
+    }
+    return { success: false, message: msg };
+  }
+
   // 3. Compute realistic execution price, DEX fees & slippage
   const entryPriceUsd = marketData.priceUsd;
   const isPump = tokenMint.endsWith('pump') || marketData.dexId === 'pumpfun';
   const dexFeePct = isPump ? 1.0 : 0.25; // 1% Pump.fun curve fee or 0.25% Raydium LP fee
 
   // Real Price Impact + Realistic Fill Slippage
-  const priceImpactPct = calculatePriceImpactPct(amountSol * solPriceUsd, effectiveLiquidity);
+  const priceImpactPct = calculatePriceImpactPct(buyAmountSol * solPriceUsd, effectiveLiquidity);
   const slippageMultiplier = 1 + (priceImpactPct / 100) + ((CONFIG.SLIPPAGE_PCT * 0.25) / 100);
   const effectiveEntryPriceUsd = entryPriceUsd * slippageMultiplier;
 
   // Net SOL converted to tokens after protocol fee
-  const netSolForTokens = amountSol * (1 - dexFeePct / 100);
+  const netSolForTokens = buyAmountSol * (1 - dexFeePct / 100);
   const amountTokens = (netSolForTokens * solPriceUsd) / effectiveEntryPriceUsd;
 
   // 4. Deduct Paper Balance (Principal + Real Solana Gas/Priority/Jito Tip)
-  const totalBuyDeductionSol = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL;
+  const totalBuyDeductionSol = buyAmountSol + CONFIG.ESTIMATED_BUY_FEE_SOL;
   updatePaperBalance(-totalBuyDeductionSol);
 
   // Institutional Continuous Conditional Risk/Reward Engine
@@ -342,7 +370,7 @@ export async function executeBuyToken(
     token_name: marketData.name,
     amount_tokens: amountTokens,
     entry_price_usd: effectiveEntryPriceUsd,
-    entry_sol: amountSol,
+    entry_sol: buyAmountSol,
     whale_source: whale ? whale.label : source,
     target_tp_pct: targetTpPct,
     target_sl_pct: targetSlPct
@@ -359,7 +387,7 @@ export async function executeBuyToken(
     `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
     `📝 *CA:* \`${tokenMint}\`\n\n` +
     `📊 *Rincian Order:*\n` +
-    `• Nominal Kita: *${amountSol.toFixed(3)} SOL* (~$${(amountSol * solPriceUsd).toFixed(2)})\n` +
+    `• Nominal Kita: *${buyAmountSol.toFixed(3)} SOL* (~$${(buyAmountSol * solPriceUsd).toFixed(2)})\n` +
     `${whaleBuyVol}` +
     `• Harga Entry: *${formatPrice(effectiveEntryPriceUsd)}*\n` +
     `• Market Cap: *$${formatNumber(marketData.marketCap)}*\n` +

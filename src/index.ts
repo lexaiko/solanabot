@@ -35,36 +35,17 @@ async function main() {
         return;
       }
 
-      // God-Tier Quantitative Capital Allocation: Fractional Kelly Criterion + Liquidity Depth Cap
-      const balance = getPaperBalance();
-      const { getSolPriceUsd, getTokenMarketData } = await import('./services/dexscreener');
-      const { calculateKellyPositionSize } = await import('./services/kellyEngine');
-      const solPrice = await getSolPriceUsd();
-
-      let poolLiquidityUsd = 10000;
-      let volatility5mPct = 0;
-      let market: any = null;
-      try {
-        market = await getTokenMarketData(tokenMint);
-        if (market) {
-          if (market.liquidityUsd > 0) poolLiquidityUsd = market.liquidityUsd;
-          if (market.priceChange5m !== undefined) volatility5mPct = market.priceChange5m;
-        }
-      } catch {}
-
-      const kellyResult = calculateKellyPositionSize(currentWhale, poolLiquidityUsd, solPrice, balance, volatility5mPct);
-      const positionSizeSol = kellyResult.allocatedSol;
-
-      console.log(`[AutoTrade] ⚡ Kelly Sizing Active for [${currentWhale.tier}] ${currentWhale.label}: ${positionSizeSol} SOL (${kellyResult.rationale})`);
-
       let whaleEntryPriceUsd: number | undefined = undefined;
-      if (tokenAmount && tokenAmount > 0) {
+      if (tokenAmount && tokenAmount > 0 && solAmount && solAmount > 0) {
         try {
+          const { getSolPriceUsd } = await import('./services/dexscreener');
+          const solPrice = await getSolPriceUsd();
           whaleEntryPriceUsd = (solAmount * solPrice) / tokenAmount;
         } catch {}
       }
 
-      await executeBuyToken(tokenMint, positionSizeSol, 'COPY_TRADE', currentWhale, whaleEntryPriceUsd, market || undefined, solAmount);
+      // Delegate risk evaluation and lazy Kelly sizing to executeBuyToken (only calculated if all safety & volume filters pass)
+      await executeBuyToken(tokenMint, 0, 'COPY_TRADE', currentWhale, whaleEntryPriceUsd, undefined, solAmount);
     } else if (action === 'SELL') {
       console.log(`[AutoTrade] 🚨 Whale Sell Event: [${currentWhale.tier || 'VERIFIED'}] ${currentWhale.label} dumped token ${tokenMint} (${tokenAmount || 0} tokens)`);
 
