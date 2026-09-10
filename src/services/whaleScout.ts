@@ -167,84 +167,148 @@ export async function isMevBotSuspect(walletAddress: string, signatures: any[]):
 }
 
 // ============================================================================
-// WALLET CLUSTER DETECTION — Independent Conviction Deduplication
+// WALLET CLUSTER DETECTION — Funding-Linked Cluster Deduplication
 // ============================================================================
+
 /**
- * Detects whether a set of wallet addresses share a common funding source.
- * Wallets funded by the same originator wallet are treated as ONE economic entity,
- * preventing a single actor controlling multiple wallets from inflating convergenceCount.
+ * Known high-volume common funder addresses: exchange hot wallets, bridges, OTC desks.
+ * Wallets that share one of these as funder are NOT grouped into the same cluster —
+ * they are treated as independent because any number of separate traders can
+ * withdraw from the same exchange without being the same economic actor.
  *
- * Method: For each wallet, fetch its oldest on-chain transaction and find the
- * first SOL transfer *into* the wallet. That sender = funding source.
- * Wallets sharing the same funder are grouped into one cluster.
+ * This list is best-effort and should be updated as new exchange wallets are identified.
+ */
+const KNOWN_COMMON_FUNDERS = new Set([
+  // ── Binance hot wallets (Solana chain) ──
+  '5tzFkiKscXHK5ms9wgXx7ek2G6reCMv99tHjwKDFTeHt',
+  'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtW2',
+  'U5mVCDPMBEMbsEMZTWGDwSi3mBAxuFbkL3pjHV9Lbhm',
+  // ── OKX ──
+  'FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5',
+  // ── Bybit ──
+  'A77HErqnrHjNuFBBmCKBBPRp3PD19RVSM3TA3bkBMBxB',
+  // ── Coinbase / CB Prime ──
+  'H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS',
+  // ── Gate.io ──
+  'GJRs4FwHtemZ5ZE9x3FNvJ8TMwitKTh21yxdRPqn7as5',
+  // ── Wormhole bridge ──
+  'worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth',
+  // ── Allbridge ──
+  'FPVMZpDPGHmKjGLECmqSoovDkM1YGvhJzD5pLzTPkXjZ',
+]);
+
+/**
+ * Paginates backwards through a wallet's transaction history (oldest-first direction)
+ * to find its earliest known funding source.
+ *
+ * Uses `before` cursor pagination — NOT `reverse: true` (unsupported by Solana RPC).
+ * Caps at MAX_FUNDING_BATCHES × 200 signatures to bound RPC cost.
  *
  * Returns:
- *   clusterCount  — number of truly independent funding sources
- *   clusterMap    — Map<funderAddress, walletAddress[]> for logging
+ *   - The funder wallet address if found and not a common/exchange funder
+ *   - `ORIGIN_${addr}` if origin is unknown, unfundable, or a common funder
+ */
+const MAX_FUNDING_BATCHES = 3; // max 600 sigs scanned per wallet
+
+async function findFundingSource(addr: string): Promise<string> {
+  const BATCH_SIZE = 200;
+  let beforeCursor: string | undefined = undefined;
+  let oldestSigFound: string | null = null;
+
+  // Paginate backwards to approximate the wallet's oldest transaction
+  for (let batch = 0; batch < MAX_FUNDING_BATCHES; batch++) {
+    const opts: { limit: number; before?: string } = { limit: BATCH_SIZE };
+    if (beforeCursor) opts.before = beforeCursor;
+
+    const sigs = await connection.getSignaturesForAddress(
+      new PublicKey(addr),
+      opts,
+      'confirmed'
+    );
+
+    if (sigs.length === 0) break;
+
+    // Last element in each batch = oldest in that batch (newest-first ordering)
+    oldestSigFound = sigs[sigs.length - 1].signature;
+    beforeCursor = oldestSigFound;
+
+    // If this batch returned fewer than BATCH_SIZE, we've reached the true beginning
+    if (sigs.length < BATCH_SIZE) break;
+
+    // Otherwise, continue paginating to find older transactions
+  }
+
+  if (!oldestSigFound) return `ORIGIN_${addr}`;
+
+  // Parse the oldest transaction we found to identify the funding source
+  const parsedTx = await connection.getParsedTransaction(oldestSigFound, {
+    maxSupportedTransactionVersion: 0,
+    commitment: 'confirmed'
+  });
+
+  if (!parsedTx?.meta?.preBalances || !parsedTx?.meta?.postBalances) {
+    return `ORIGIN_${addr}`;
+  }
+
+  const accountKeys = parsedTx.transaction.message.accountKeys;
+  for (let i = 0; i < accountKeys.length; i++) {
+    const key = accountKeys[i].pubkey.toBase58();
+    if (key === addr) continue;
+    if (SYSTEM_BLACKLIST.has(key)) continue;
+    const preBal = parsedTx.meta.preBalances[i] || 0;
+    const postBal = parsedTx.meta.postBalances[i] || 0;
+    // This account's SOL balance decreased → it sent SOL to our wallet
+    if (preBal > postBal && (preBal - postBal) > 5_000_000) { // > 0.005 SOL
+      // If funder is a known exchange/bridge, do NOT group wallets together.
+      // Two separate traders withdrawing from the same CEX are not the same entity.
+      if (KNOWN_COMMON_FUNDERS.has(key)) {
+        console.log(`[WhaleScout PRO] 🏦 Common funder (CEX/bridge) detected for ${addr.slice(0,8)}: ${key.slice(0,8)}... → treating as independent`);
+        return `ORIGIN_${addr}`;
+      }
+      return key;
+    }
+  }
+
+  return `ORIGIN_${addr}`;
+}
+
+/**
+ * Groups candidate wallet addresses into funding-linked clusters.
+ *
+ * A "funding-linked cluster" = two or more wallets whose earliest detected
+ * funding source is the same non-exchange wallet. This is a heuristic signal
+ * (not proof of same-entity control), used to avoid double-counting
+ * convergence when a single actor funds multiple wallets.
+ *
+ * Known CEX/bridge funders are explicitly excluded from grouping.
+ *
+ * Returns:
+ *   clusterCount     — number of distinct funding clusters (used as convergenceCount)
+ *   clusterMap       — Map<funderKey, walletAddress[]> for audit/logging
+ *   walletFunderMap  — Map<wallet, funderKey> for per-candidate annotation
  */
 export async function detectWalletCluster(walletAddresses: string[]): Promise<{
   clusterCount: number;
   clusterMap: Map<string, string[]>;
-  walletFunderMap: Map<string, string>;  // wallet → funder
+  walletFunderMap: Map<string, string>;
 }> {
   const clusterMap = new Map<string, string[]>();
   const walletFunderMap = new Map<string, string>();
 
   for (const addr of walletAddresses) {
-    let funderKey = `ORIGIN_${addr}`; // default: treat as independent if no funder found
+    let funderKey = `ORIGIN_${addr}`;
     try {
-      // Fetch oldest signatures (reverse order = oldest first with before param)
-      const sigs = await connection.getSignaturesForAddress(
-        new PublicKey(addr),
-        { limit: 200 },
-        'confirmed'
-      );
-      if (sigs.length === 0) {
-        walletFunderMap.set(addr, funderKey);
-        const g = clusterMap.get(funderKey) || [];
-        g.push(addr);
-        clusterMap.set(funderKey, g);
-        continue;
-      }
-
-      // Oldest transaction = last element in array (getSignaturesForAddress returns newest-first)
-      const oldestSig = sigs[sigs.length - 1].signature;
-      const parsedTx = await connection.getParsedTransaction(oldestSig, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed'
-      });
-
-      if (parsedTx?.meta?.preBalances && parsedTx?.meta?.postBalances) {
-        const accountKeys = parsedTx.transaction.message.accountKeys;
-        // Find any account that sent SOL to this wallet in the oldest tx
-        for (let i = 0; i < accountKeys.length; i++) {
-          const key = accountKeys[i].pubkey.toBase58();
-          if (key === addr) continue;
-          if (SYSTEM_BLACKLIST.has(key)) continue;
-          const preBal = parsedTx.meta.preBalances[i] || 0;
-          const postBal = parsedTx.meta.postBalances[i] || 0;
-          // This account's balance decreased (it sent SOL to our wallet)
-          if (preBal > postBal && (preBal - postBal) > 5_000_000) { // > 0.005 SOL sent
-            funderKey = key;
-            break;
-          }
-        }
-      }
+      funderKey = await findFundingSource(addr);
     } catch {
-      // On error, treat as independent origin
+      // On any RPC error, treat as independent origin
     }
-
     walletFunderMap.set(addr, funderKey);
     const group = clusterMap.get(funderKey) || [];
     group.push(addr);
     clusterMap.set(funderKey, group);
   }
 
-  return {
-    clusterCount: clusterMap.size,
-    clusterMap,
-    walletFunderMap
-  };
+  return { clusterCount: clusterMap.size, clusterMap, walletFunderMap };
 }
 
 // ============================================================================
@@ -815,12 +879,14 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
       const tierEmoji = tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬';
       const sourceTag = isMigration ? '🚀 *Raydium Migration*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
 
-      // Build cluster label: show deduplication result if applicable
+      // Build cluster label: show funding-cluster deduplication result
+      // NOTE: "funding cluster" = heuristic grouping by shared funder, NOT proof of same identity.
+      // Wallets from known exchanges (same CEX funder) are never grouped.
       const clusterLabel = rawWalletCount > convergenceCount
-        ? `*${convergenceCount} entitas independen* (${rawWalletCount} wallet, ${rawWalletCount - convergenceCount} terkonfirmasi 1 cluster)`
-        : `*${convergenceCount} wallet independen*`;
+        ? `*${convergenceCount} funding cluster* (${rawWalletCount} wallet terdeteksi, ${rawWalletCount - convergenceCount} wallet berbagi funder yang sama)`
+        : `*${convergenceCount} wallet* (funder berbeda / tidak terdeteksi satu asal)`;
 
-      // Send convergence alert if multiple independent entities detected
+      // Send convergence alert if multiple funding clusters detected
       if (convergenceCount >= 2) {
         const convMsg = `${tierEmoji} *KONVERGENSI SMART MONEY TERDETEKSI!* ${tier === 'CONVICTION' ? '🔥' : ''}
 
@@ -833,7 +899,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
           `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
 ` +
-          `👥 *Smart Wallet Masuk:* ${clusterLabel}
+          `🔗 *Funding Cluster Terdeteksi:* ${clusterLabel}
 ` +
           `💰 *Total SOL Masuk:* *${totalSolEntered.toFixed(2)} SOL*
 ` +
@@ -842,7 +908,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           `🏆 *Wallet Terbaik:* \`${bestCandidate.address.slice(0,8)}...\` (WR: ${bestCandidate.winRate.toFixed(0)}%, beli ${bestCandidate.solSpent.toFixed(2)} SOL)
 
 ` +
-          `_Bot merekrut wallet dengan score terbaik dari kelompok ini sebagai signal anchor._`;
+          `_Bot merekrut wallet dengan score terbaik dari kluster ini sebagai signal anchor._`;
         await notify(convMsg);
       }
 
@@ -869,7 +935,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📊 *Win Rate Historical:* *${bestCandidate.winRate.toFixed(0)}%* (${bestCandidate.totalTrades} swaps)
 ` +
-            `👥 *Konvergensi:* ${clusterLabel}
+            `🔗 *Funding Cluster:* ${clusterLabel}
 ` +
             `💸 *Total SOL Kelompok:* *${totalSolEntered.toFixed(2)} SOL*
 ` +
@@ -882,7 +948,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
             `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
 
 ` +
-            `_💡 Bot memantau konvergensi ${convergenceCount} entitas independen di token ini secara real-time._`;
+            `_💡 Bot memantau ${convergenceCount} funding cluster berbeda di token ini secara real-time._`;
 
           await notify(recruitMsg);
         }
@@ -912,7 +978,7 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
 ` +
             `📝 *Alamat:* \`${feePayerKey}\`
 ` +
-            `🧠 *SMS Score:* *${score}/100* [${tier}] | Konvergensi: ${clusterLabel}
+            `🔗 *Funding Cluster:* ${clusterLabel}
 ` +
             `_⚠️ SMS = ranking konvergensi internal — bukan probabilitas harga naik._
 ` +
