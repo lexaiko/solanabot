@@ -64,11 +64,11 @@ export function calculateKellyPositionSize(
   // If edge is negative, allocate minimal testing size
   if (rawKelly <= 0) {
     return {
-      allocatedSol: 0.03,
+      allocatedSol: 0.05,
       kellyFraction: 0,
       rawKelly,
-      liquidityCapSol: 0.03,
-      rationale: `Negative Kelly edge (${(rawKelly * 100).toFixed(1)}%). Minimal testing size 0.03 SOL.`
+      liquidityCapSol: 0.05,
+      rationale: `Negative Kelly edge (${(rawKelly * 100).toFixed(1)}%). Minimal viable testing size 0.05 SOL.`
     };
   }
 
@@ -101,7 +101,8 @@ export function calculateKellyPositionSize(
     ? Math.pow(0.75, whale.consecutive_losses)
     : 1.0;
 
-  const floorSol = Math.max(0.03, Math.min(0.05, portfolioBalanceSol * 0.01)); // Minimum viable order on Solana
+  // Anti-Fee-Drag Floor: Guarantees position size is large enough so on-chain fee is < 1.5%
+  const floorSol = Math.max(0.05, Math.min(0.08, portfolioBalanceSol * 0.05));
 
   // Base allocation bounded by Kelly, Risk Budget, Dynamic Exposure Cap, and Pool Liquidity
   const baseAllocation = Math.min(kellySol, dynamicRiskBudgetSol, dynamicExposureCap, liquidityCapSol);
