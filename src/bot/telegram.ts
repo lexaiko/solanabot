@@ -46,6 +46,16 @@ import {
 
 export const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
 
+// Global Error Handler: Prevents Telegram unhandled rejections from freezing bot polling
+bot.catch((err: any, ctx: any) => {
+  console.error('[Telegram] Global bot error handler caught update error:', err?.message || err);
+  try {
+    if (ctx?.answerCbQuery) {
+      ctx.answerCbQuery('⚠️ Terjadi kendala memproses tombol.').catch(() => {});
+    }
+  } catch {}
+});
+
 /**
  * Bulletproof Markdown sender: Falls back to clean text if markdown entities are invalid.
  * Guarantees the user always receives a response and never gets stuck!
