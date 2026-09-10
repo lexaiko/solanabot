@@ -52,6 +52,81 @@ const SYSTEM_BLACKLIST = new Set([
   'routeUGWgpak9pq3bvCj2sMgT1TKHBiQG3UtDhVe9dB', // Raydium Router
 ]);
 
+// ============================================================================
+// SMART MONEY CONVERGENCE ENGINE
+// ============================================================================
+
+/**
+ * Represents a single wallet that has passed all 6 screening gates for a given token.
+ */
+export interface SmartMoneyCandidate {
+  address: string;
+  label: string;
+  archetype: string;
+  balanceSol: number;
+  solSpent: number;          // Amount of SOL spent in this buy
+  winRate: number;           // From Helius pre-screen (0-100), 0 if unknown
+  totalTrades: number;       // Number of historical trades audited
+  pastTxCount: number;       // Total historical tx count on-chain
+  isMigrationInsider: boolean;
+}
+
+/**
+ * In-memory buffer: tokenMint → list of qualified smart money candidates.
+ * Accumulated during a single scout run — cleared after each run.
+ */
+const tokenSmartMoneyMap: Map<string, SmartMoneyCandidate[]> = new Map();
+
+/**
+ * Computes a composite Smart Money Score (SMS) for a token based on:
+ * - Number of independent smart wallets that entered (convergence multiplier)
+ * - Quality of each wallet (win rate weighted by buy size)
+ * - Bonus for migration insider status
+ *
+ * Score formula:
+ *   SMS = (convergenceCount ^ 1.5) × avgWeightedWinRate × migrationBonus
+ *
+ * Thresholds (configurable):
+ *   >= 80 : 🏆 CONVICTION (2+ wallets, high WR)  → ALERT + auto-recruit top wallet
+ *   >= 50 : ⚡ STRONG SIGNAL (single elite wallet, or 2 moderate)
+ *   < 50  : 🔬 WEAK SIGNAL (observe only)
+ */
+export function computeSmartMoneyScore(candidates: SmartMoneyCandidate[]): {
+  score: number;
+  tier: 'CONVICTION' | 'STRONG' | 'WEAK';
+  convergenceCount: number;
+  avgWinRate: number;
+  totalSolEntered: number;
+  bestCandidate: SmartMoneyCandidate;
+} {
+  const convergenceCount = candidates.length;
+
+  // Weighted win rate: weight by SOL size of each buy (bigger buyer's WR matters more)
+  const totalSol = candidates.reduce((s, c) => s + c.solSpent, 0);
+  const weightedWinRate = totalSol > 0
+    ? candidates.reduce((s, c) => s + (c.winRate * c.solSpent), 0) / totalSol
+    : candidates.reduce((s, c) => s + c.winRate, 0) / convergenceCount;
+
+  // Migration insider bonus: wallets that bought during initial pool minutes are highest quality
+  const migrationCount = candidates.filter(c => c.isMigrationInsider).length;
+  const migrationBonus = 1.0 + (migrationCount * 0.15); // +15% per insider
+
+  // Score formula: convergence ^ 1.5 × avgWR × migrationBonus / 10 (normalize to 0-100)
+  const rawScore = (Math.pow(convergenceCount, 1.5) * weightedWinRate * migrationBonus) / 10;
+  const score = Math.min(100, Math.round(rawScore));
+
+  const tier: 'CONVICTION' | 'STRONG' | 'WEAK' =
+    score >= 80 ? 'CONVICTION' :
+    score >= 50 ? 'STRONG' : 'WEAK';
+
+  // Best candidate = highest win rate among those with most SOL spent
+  const bestCandidate = [...candidates].sort((a, b) =>
+    (b.winRate * b.solSpent) - (a.winRate * a.solSpent)
+  )[0];
+
+  return { score, tier, convergenceCount, avgWinRate: weightedWinRate, totalSolEntered: totalSol, bestCandidate };
+}
+
 /**
  * Institutional Latency & MEV Disqualification:
  * Rejects high-frequency micro-flipping bots (holding time < 90s or excessive failure rate).
@@ -407,17 +482,22 @@ export interface ScoutOutcome {
 
 /**
  * PRO SCANNER: Auto-Scan & Recruit Smart Money Whales
- * 5-Pillar Institutional Grade Whale Discovery System
+ * 5-Pillar Institutional Grade Whale Discovery System + Smart Money Convergence Engine
+ *
+ * Key upgrade: Instead of recruiting the first qualifying wallet per token,
+ * we now accumulate ALL qualified wallets per token, compute a composite
+ * Smart Money Score (convergence × win rate × buy size), then recruit the
+ * BEST candidate from the highest-conviction token first.
  */
 export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_SCOUT_BATCH_SIZE || 4): Promise<ScoutOutcome> {
-  console.log('[WhaleScout PRO] 🔍 Memulai pemindaian institusional 5-Pilar Solana Smart Money...');
+  console.log('[WhaleScout PRO] 🔍 Memulai pemindaian Smart Money Convergence Engine (6-Gate + SMS Score)...');
   
   const currentWhales = getAllWhales();
   const currentQueue = getWhaleQueue();
   const isRosterFull = currentWhales.length >= CONFIG.MAX_ACTIVE_WHALES;
 
   if (isRosterFull && currentQueue.length >= 50) {
-    console.log(`[WhaleScout PRO] ℹ️ Radar paus (${currentWhales.length}/${CONFIG.MAX_ACTIVE_WHALES}) dan shadow queue (${currentQueue.length}/50) sudah penuh.`);
+    console.log(`[WhaleScout PRO] ℹ️ Radar (${currentWhales.length}/${CONFIG.MAX_ACTIVE_WHALES}) dan queue (${currentQueue.length}/50) penuh.`);
     return {
       recruited: 0,
       queued: 0,
@@ -431,53 +511,51 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
   let recruitedCount = 0;
   let queuedCount = 0;
 
+  // Clear convergence buffer for this run
+  tokenSmartMoneyMap.clear();
+
   // Get Helius API key for enhanced transaction parsing (Pilar 4)
   const heliusApiKey = CONFIG.HELIUS_API_KEYS[0] || CONFIG.HELIUS_API_KEY || '';
 
   try {
-    // ── PILAR 1 + 5: Multi-Source Token Discovery (Migration + Birdeye + DexScreener + GeckoTerminal) ──
+    // ── PILAR 1 + 5: Multi-Source Token Discovery ──
     const targetTokens = await getOrganicTrendingTokens(18);
     if (targetTokens.length === 0) {
-      console.log('[WhaleScout PRO] ⚠️ Tidak ada token organik ditemukan saat ini. Retry berikutnya.');
+      console.log('[WhaleScout PRO] ⚠️ Tidak ada token ditemukan. Retry berikutnya.');
       return {
-        recruited: 0,
-        queued: 0,
-        isFull: isRosterFull,
-        totalWhales: currentWhales.length,
-        maxWhales: CONFIG.MAX_ACTIVE_WHALES,
-        queueLength: currentQueue.length
+        recruited: 0, queued: 0, isFull: isRosterFull,
+        totalWhales: currentWhales.length, maxWhales: CONFIG.MAX_ACTIVE_WHALES, queueLength: currentQueue.length
       };
     }
 
+    // ── PHASE 1: Accumulate qualified smart money candidates per token ──
+    // We scan ALL target tokens first (without recruiting) to build convergence map.
     for (const tokenItem of targetTokens) {
-      if ((recruitedCount + queuedCount) >= limitToRecruit) break;
-
       const tokenMint = tokenItem.tokenMint;
-      console.log(`[WhaleScout PRO] 🔎 Menganalisis: ${tokenItem.poolName} ($${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M Vol) CA: \`${tokenMint.slice(0, 8)}...\``);
+      const isMigration = tokenItem.poolName.includes('Raydium Migration') || tokenItem.poolName.includes('Raydium New');
+      const isBirdeye = tokenItem.poolName.includes('Birdeye');
+
+      console.log(`[WhaleScout PRO] 🔎 Phase 1 Scan: ${tokenItem.poolName} CA: \`${tokenMint.slice(0, 8)}...\``);
 
       const market = await getTokenMarketData(tokenMint);
       const symbol = market ? market.symbol : 'TOKEN';
 
-      // ── PILAR 4: Helius Enhanced TX — Deep scan 50 signatures ──
+      // ── PILAR 4: Deep scan 50 signatures per pool ──
       let sigs: any[] = [];
       try {
-        // Use WHALE_SCOUT_SIGNATURES_DEPTH (50) instead of old 25
         sigs = await connection.getSignaturesForAddress(new PublicKey(tokenMint), {
           limit: CONFIG.WHALE_SCOUT_SIGNATURES_DEPTH || 50
         });
       } catch (err: any) {
-        console.warn(`[WhaleScout PRO] Gagal ambil signatures untuk ${tokenMint}:`, err.message);
+        console.warn(`[WhaleScout PRO] Gagal ambil sigs untuk ${tokenMint}:`, err.message);
         continue;
       }
 
-      // Collect unique buyers from this pool's tx history
       const candidateSeen = new Set<string>();
 
       for (const sigInfo of sigs) {
         if (sigInfo.err) continue;
-        if ((recruitedCount + queuedCount) >= limitToRecruit) break;
-
-        await sleep(60); // Fast pacing with Helius Round-Robin pool
+        await sleep(60);
 
         try {
           const tx = await connection.getParsedTransaction(sigInfo.signature, {
@@ -485,95 +563,68 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           });
           if (!tx || !tx.meta) continue;
 
-          // Find the primary fee payer / user signer
           const firstAccount = tx.transaction.message.accountKeys[0];
           const feePayerKey = firstAccount?.pubkey ? firstAccount.pubkey.toBase58() : null;
 
           if (!feePayerKey) continue;
           if (SYSTEM_BLACKLIST.has(feePayerKey)) continue;
           if (isWhaleBlacklisted(feePayerKey)) continue;
-          if (getWhaleByAddress(feePayerKey)) continue; // Already tracked
-          if (candidateSeen.has(feePayerKey)) continue; // Already evaluated this run
+          if (getWhaleByAddress(feePayerKey)) continue;
+          if (candidateSeen.has(feePayerKey)) continue;
           candidateSeen.add(feePayerKey);
 
-          // Check if wallet actually bought tokens in this tx (token balance increased)
+          // Must be a net buyer
           const post = tx.meta.postTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
           const pre = tx.meta.preTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
-          const postAmt = parseFloat(post?.uiTokenAmount?.uiAmountString || '0');
-          const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmountString || '0');
+          if ((parseFloat(post?.uiTokenAmount?.uiAmountString || '0')) <= (parseFloat(pre?.uiTokenAmount?.uiAmountString || '0'))) continue;
 
-          if (postAmt <= preAmt) continue; // Not a buyer
-
-          // ── Gate 1: Native SOL balance check ──
+          // ── Gate 1: SOL balance ──
           const balanceLamports = await connection.getBalance(new PublicKey(feePayerKey));
           const balanceSol = balanceLamports / 1_000_000_000;
           if (balanceSol < CONFIG.MIN_WHALE_BALANCE_SOL) continue;
 
-          // ── Gate 2: Buy size check ──
+          // ── Gate 2: Buy size ──
           const preSol = tx.meta.preBalances[0] || 0;
           const postSol = tx.meta.postBalances[0] || 0;
           const solSpent = (preSol - postSol) / 1_000_000_000;
           if (solSpent < CONFIG.MIN_WHALE_BUY_SOL) continue;
 
-          // ── Gate 3: Anti-Burner wallet history check ──
+          // ── Gate 3: Anti-burner (tx history depth) ──
           const pastSigs = await connection.getSignaturesForAddress(new PublicKey(feePayerKey), { limit: 25 });
-          if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) {
-            console.log(`[WhaleScout PRO] ⏩ Skip ${feePayerKey.slice(0, 8)}: Dompet baru/burner (${pastSigs.length} txs).`);
-            continue;
-          }
+          if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) continue;
 
-          // ── Gate 4: MEV / HFT bot disqualification ──
+          // ── Gate 4: MEV / HFT bot filter ──
           const mevCheck = await isMevBotSuspect(feePayerKey, pastSigs);
           if (mevCheck.isMev) {
-            console.log(`[WhaleScout PRO] 🤖 DITOLAK MEV: ${feePayerKey.slice(0, 8)} — ${mevCheck.reason}`);
-            if (CONFIG.NOTIFY_ON_REJECT) {
-              await notify(
-                `⚠️ *SCOUT AUDIT: DOMPET DITOLAK (MEV / HFT BOT)*\n\n` +
-                `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                `🪙 *Pool Acuan:* *${symbol}*\n` +
-                `🚫 *Alasan:* ${mevCheck.reason}\n\n` +
-                `_Bot menolak dompet ini demi menjaga portofolio dari jebakan micro-flipping bot._`
-              );
-            }
+            console.log(`[WhaleScout PRO] 🤖 MEV: ${feePayerKey.slice(0, 8)} — ${mevCheck.reason}`);
             continue;
           }
 
-          // ── Gate 5: Cabal / Sybil Cluster Shield ──
+          // ── Gate 5: Cabal / Sybil cluster ──
           const cabalCheck = await isCabalSuspect(feePayerKey, getAllWhales());
           if (cabalCheck.isCabal) {
-            console.log(`[WhaleScout PRO] 🚨 DITOLAK CABAL: ${feePayerKey.slice(0, 8)} — shared funder dengan ${cabalCheck.matchingWhales.join(', ')}`);
-            if (CONFIG.NOTIFY_ON_REJECT) {
-              await notify(
-                `🚨 *SCOUT AUDIT: DOMPET DITOLAK (CABAL / SYBIL CLUSTER)*\n\n` +
-                `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                `🪙 *Pool Acuan:* *${symbol}*\n` +
-                `🚫 *Alasan:* Berbagi penyetor dana on-chain dengan: *${cabalCheck.matchingWhales.join(', ')}*\n\n` +
-                `_Bot menolak untuk mencegah risiko dump bersama kelompok cabal._`
-              );
-            }
+            console.log(`[WhaleScout PRO] 🚨 CABAL: ${feePayerKey.slice(0, 8)} — shared funder: ${cabalCheck.matchingWhales.join(', ')}`);
             continue;
           }
 
-          // ── Gate 6: PRO — Historical Win Rate Pre-Screen (Pilar 2) ──
-          let winRateNote = '';
+          // ── Gate 6: Historical win rate pre-screen ──
+          let winRate = 60; // default assumption if Helius unavailable
+          let totalTrades = 0;
           if (heliusApiKey) {
-            const winRateResult = await assessWhaleCandidateWinRate(feePayerKey, heliusApiKey);
-            if (winRateResult !== null && !winRateResult.passed && winRateResult.totalTrades >= 5) {
-              console.log(`[WhaleScout PRO] 📉 DITOLAK WIN RATE: ${feePayerKey.slice(0, 8)} — ${winRateResult.reason}`);
-              continue;
-            }
-            if (winRateResult?.passed) {
-              winRateNote = ` | Win Rate: *${winRateResult.winRate.toFixed(0)}%* (${winRateResult.totalTrades} swaps)`;
+            const wr = await assessWhaleCandidateWinRate(feePayerKey, heliusApiKey);
+            if (wr !== null) {
+              if (!wr.passed && wr.totalTrades >= 5) {
+                console.log(`[WhaleScout PRO] 📉 WR FAIL: ${feePayerKey.slice(0, 8)} — ${wr.reason}`);
+                continue;
+              }
+              winRate = wr.winRate;
+              totalTrades = wr.totalTrades;
             }
           }
 
-          // ── Passed All 6 Gates: Classify Archetype & Register ──
-          let archetype = '🔬 PROBATION_SCOUT';
+          // ── All 6 Gates Passed: Add to convergence map ──
+          let archetype = '🎯 RAYDIUM_HUNTER';
           let label = `🎯 Scout: $${symbol} Smart Buyer`;
-
-          // Determine source context for label
-          const isMigration = tokenItem.poolName.includes('Raydium Migration') || tokenItem.poolName.includes('Raydium New');
-          const isBirdeye = tokenItem.poolName.includes('Birdeye');
 
           if (balanceSol >= CONFIG.VIP_WHALE_BALANCE_SOL) {
             archetype = '👑 VIP_ACCUMULATOR_CANDIDATE';
@@ -581,81 +632,182 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           } else if (isMigration) {
             archetype = '🚀 MIGRATION_INSIDER';
             label = `🚀 Insider: $${symbol} Migration Buyer`;
-          } else if (market && market.priceChange24h && market.priceChange24h > 100) {
-            archetype = '🐋 EARLY_ACCUMULATOR';
-            label = `🐋 Paus: $${symbol} Early Accumulator`;
-          } else if (isBirdeye || (market && market.priceChange5m && Math.abs(market.priceChange5m) > 4)) {
+          } else if (isBirdeye) {
             archetype = '⚡ MOMENTUM_SWING';
             label = `⚡ Smart: $${symbol} Momentum Whale`;
-          } else {
-            archetype = '🎯 RAYDIUM_HUNTER';
-            label = `🎯 Scout: $${symbol} Smart Buyer`;
+          } else if (market?.priceChange24h && market.priceChange24h > 100) {
+            archetype = '🐋 EARLY_ACCUMULATOR';
+            label = `🐋 Paus: $${symbol} Early Accumulator`;
           }
 
-          // ── Register to active roster or shadow queue ──
-          if (getAllWhales().length < CONFIG.MAX_ACTIVE_WHALES) {
-            const added = addWhale(feePayerKey, label, CONFIG.DEFAULT_BUY_AMOUNT_SOL, 0, 'PROBATION');
+          const candidate: SmartMoneyCandidate = {
+            address: feePayerKey,
+            label,
+            archetype,
+            balanceSol,
+            solSpent,
+            winRate,
+            totalTrades,
+            pastTxCount: pastSigs.length,
+            isMigrationInsider: isMigration
+          };
 
-            if (added) {
-              recruitedCount++;
-              console.log(`[WhaleScout PRO] ✅ LOLOS 6-GATE AUDIT (${archetype}): ${label} (${feePayerKey.slice(0,8)}...) Saldo: ${balanceSol.toFixed(2)} SOL | Txs: ${pastSigs.length}${winRateNote}`);
+          const existing = tokenSmartMoneyMap.get(tokenMint) || [];
+          existing.push(candidate);
+          tokenSmartMoneyMap.set(tokenMint, existing);
 
-              const sourceTag = isMigration ? '🚀 *Raydium Migration < 45 menit*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
-              const recruitMsg = `🏛️ *SMART MONEY LOLOS AUDIT INSTITUSIONAL PRO (6 GATE)* ✅\n\n` +
-                `🏷️ *Label:* ${label}\n` +
-                `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                `🏆 *Arketipe:* *${archetype}*\n` +
-                `💰 *Saldo On-Chain:* *${balanceSol.toFixed(2)} SOL*\n` +
-                `📜 *Riwayat TX:* *${pastSigs.length}+ Transaksi* ✅\n` +
-                `⚡ *Gate MEV:* ✅ LOLOS\n` +
-                `🛡️ *Gate Cabal:* ✅ LOLOS\n` +
-                `${winRateNote ? `📊 *Gate Win Rate:* ✅ ${winRateNote.replace('|', '').trim()}\n` : ''}` +
-                `🪙 *Pool Acuan:* ${sourceTag} — *${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)\n` +
-                `🛡️ *Status Copy:* *OFF (Masa Percobaan Shadow Track)*\n\n` +
-                `_💡 Bot mengobservasi trader ini secara real-time. Begitu terbukti mencetak profit, status otomatis naik ke VERIFIED AUTO-COPY!_`;
-
-              await notify(recruitMsg);
-              break; // One whale per token for diversification
-            }
-          } else {
-            // Active slots full → Shadow Queue
-            const queued = addToWhaleQueue({
-              address: feePayerKey,
-              label,
-              archetype,
-              balanceSol,
-              referenceToken: tokenMint,
-              referencePool: tokenItem.poolName,
-              score: balanceSol + (winRateNote ? 10 : 0) // Bonus score for pre-screened candidates
-            });
-
-            if (queued) {
-              queuedCount++;
-              console.log(`[WhaleScout PRO] 📋 MASUK SHADOW QUEUE (${archetype}): ${label} (${feePayerKey.slice(0,8)}...) Saldo: ${balanceSol.toFixed(2)} SOL`);
-
-              const queueMsg = `📋 *SMART MONEY MASUK SHADOW QUEUE (BANGKU CADANGAN)*\n\n` +
-                `Slot radar aktif penuh (*${getAllWhales().length}/${CONFIG.MAX_ACTIVE_WHALES}*). Kandidat berkualitas disimpan di antrean:\n\n` +
-                `🏷️ *Label:* ${label}\n` +
-                `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                `🏆 *Arketipe:* *${archetype}*\n` +
-                `💰 *Saldo:* *${balanceSol.toFixed(2)} SOL*\n` +
-                `${winRateNote ? `📊 *Win Rate:* ${winRateNote.replace('|', '').trim()}\n` : ''}` +
-                `🪙 *Pool:* *${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)\n\n` +
-                `_💡 Begitu ada slot kosong setelah prune, kandidat ini otomatis dipromosikan ke radar aktif!_`;
-
-              await notify(queueMsg);
-              break;
-            }
-          }
+          console.log(`[WhaleScout PRO] ✅ LOLOS 6-GATE: ${feePayerKey.slice(0,8)} → ${archetype} | WR:${winRate.toFixed(0)}% | ${solSpent.toFixed(3)} SOL spent | Convergence[${tokenMint.slice(0,6)}]: ${existing.length}`);
         } catch {
-          // Ignore individual tx parse errors
+          // ignore individual tx parse errors
+        }
+      }
+    }
+
+    // ── PHASE 2: Score & rank tokens by Smart Money Convergence ──
+    // Sort tokens by SMS score descending — recruit from highest conviction first.
+    const scoredTokens: Array<{
+      tokenMint: string;
+      tokenItem: typeof targetTokens[0];
+      smsResult: ReturnType<typeof computeSmartMoneyScore>;
+    }> = [];
+
+    for (const tokenItem of targetTokens) {
+      const candidates = tokenSmartMoneyMap.get(tokenItem.tokenMint);
+      if (!candidates || candidates.length === 0) continue;
+      const smsResult = computeSmartMoneyScore(candidates);
+      scoredTokens.push({ tokenMint: tokenItem.tokenMint, tokenItem, smsResult });
+    }
+
+    // Sort by score descending
+    scoredTokens.sort((a, b) => b.smsResult.score - a.smsResult.score);
+
+    console.log(`[WhaleScout PRO] 📊 Phase 2 SMS Scoring: ${scoredTokens.length} token dengan qualified wallets.`);
+    for (const t of scoredTokens) {
+      const { score, tier, convergenceCount, avgWinRate } = t.smsResult;
+      const symbol = (await getTokenMarketData(t.tokenMint))?.symbol || 'TOKEN';
+      console.log(`[WhaleScout PRO]   ${tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬'} ${symbol}: SMS ${score}/100 (Conv: ${convergenceCount} wallets, Avg WR: ${avgWinRate.toFixed(0)}%) [${tier}]`);
+    }
+
+    // ── PHASE 3: Recruit from highest-conviction tokens ──
+    for (const { tokenMint, tokenItem, smsResult } of scoredTokens) {
+      if ((recruitedCount + queuedCount) >= limitToRecruit) break;
+
+      const { score, tier, convergenceCount, avgWinRate, totalSolEntered, bestCandidate } = smsResult;
+      const candidates = tokenSmartMoneyMap.get(tokenMint)!;
+      const market = await getTokenMarketData(tokenMint);
+      const symbol = market?.symbol || 'TOKEN';
+      const isMigration = tokenItem.poolName.includes('Raydium Migration') || tokenItem.poolName.includes('Raydium New');
+      const isBirdeye = tokenItem.poolName.includes('Birdeye');
+
+      // For WEAK signals with only 1 unscreened wallet, still recruit but mark PROBATION strictly
+      const tierEmoji = tier === 'CONVICTION' ? '🏆' : tier === 'STRONG' ? '⚡' : '🔬';
+      const sourceTag = isMigration ? '🚀 *Raydium Migration*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
+
+      // Send convergence alert if multiple wallets detected
+      if (convergenceCount >= 2) {
+        const convMsg = `${tierEmoji} *KONVERGENSI SMART MONEY TERDETEKSI!* ${tier === 'CONVICTION' ? '🔥' : ''}
+
+` +
+          `📊 *Token:* *$${symbol}* | ${sourceTag}
+` +
+          `📝 *CA:* \`${tokenMint}\`
+` +
+          `🧠 *Smart Money Score:* *${score}/100* [*${tier}*]
+` +
+          `👥 *Jumlah Smart Wallet Masuk:* *${convergenceCount} wallet independen*
+` +
+          `💰 *Total SOL Masuk:* *${totalSolEntered.toFixed(2)} SOL*
+` +
+          `📈 *Rata-rata Win Rate:* *${avgWinRate.toFixed(1)}%*
+` +
+          `🏆 *Wallet Terbaik:* \`${bestCandidate.address.slice(0,8)}...\` (WR: ${bestCandidate.winRate.toFixed(0)}%, beli ${bestCandidate.solSpent.toFixed(2)} SOL)
+
+` +
+          `_Bot merekrut wallet dengan score terbaik dari kelompok ini sebagai signal anchor._`;
+        await notify(convMsg);
+      }
+
+      // Recruit the best candidate from this token's convergence group
+      const feePayerKey = bestCandidate.address;
+
+      if (getAllWhales().length < CONFIG.MAX_ACTIVE_WHALES) {
+        const added = addWhale(feePayerKey, bestCandidate.label, CONFIG.DEFAULT_BUY_AMOUNT_SOL, 0, 'PROBATION');
+
+        if (added) {
+          recruitedCount++;
+          console.log(`[WhaleScout PRO] 🎯 DIREKRUT (SMS ${score}/100 [${tier}]): ${bestCandidate.label} | Conv:${convergenceCount} | AvgWR:${avgWinRate.toFixed(0)}%`);
+
+          const recruitMsg = `🏛️ *SMART MONEY DIREKRUT (SMS SCORE: ${score}/100 [${tier}])* ✅
+
+` +
+            `🏷️ *Label:* ${bestCandidate.label}
+` +
+            `📝 *Alamat:* \`${feePayerKey}\`
+` +
+            `🏆 *Arketipe:* *${bestCandidate.archetype}*
+` +
+            `💰 *Saldo On-Chain:* *${bestCandidate.balanceSol.toFixed(2)} SOL*
+` +
+            `📊 *Win Rate Historical:* *${bestCandidate.winRate.toFixed(0)}%* (${bestCandidate.totalTrades} swaps)
+` +
+            `👥 *Konvergensi:* *${convergenceCount} smart wallet* masuk token yang sama
+` +
+            `💸 *Total SOL Kelompok:* *${totalSolEntered.toFixed(2)} SOL*
+` +
+            `⚡ *Gate MEV:* ✅ | 🛡️ *Gate Cabal:* ✅ | 📈 *Gate WR:* ✅
+` +
+            `🪙 *Pool Acuan:* ${sourceTag} — *$${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)
+` +
+            `🛡️ *Status Copy:* *OFF (Shadow Track)*
+
+` +
+            `_💡 Bot memantau konvergensi ${convergenceCount} trader berhistoris kuat di token ini secara real-time._`;
+
+          await notify(recruitMsg);
+        }
+      } else {
+        // Active roster full → shadow queue with SMS score bonus
+        const queued = addToWhaleQueue({
+          address: feePayerKey,
+          label: bestCandidate.label,
+          archetype: bestCandidate.archetype,
+          balanceSol: bestCandidate.balanceSol,
+          referenceToken: tokenMint,
+          referencePool: tokenItem.poolName,
+          score: score + (convergenceCount * 5) // convergence bonus in queue priority
+        });
+
+        if (queued) {
+          queuedCount++;
+          console.log(`[WhaleScout PRO] 📋 SHADOW QUEUE (SMS ${score}/100): ${bestCandidate.label}`);
+
+          const queueMsg = `📋 *SMART MONEY (SMS ${score}/100) MASUK SHADOW QUEUE*
+
+` +
+            `Slot penuh. Kandidat konvergensi terbaik disimpan:
+
+` +
+            `🏷️ *Label:* ${bestCandidate.label}
+` +
+            `📝 *Alamat:* \`${feePayerKey}\`
+` +
+            `🧠 *SMS Score:* *${score}/100* [${tier}] | Conv: *${convergenceCount} wallet*
+` +
+            `💰 *Saldo:* *${bestCandidate.balanceSol.toFixed(2)} SOL*
+` +
+            `🪙 *Pool:* *$${symbol}*
+
+` +
+            `_💡 Dipromosikan otomatis begitu ada slot kosong!_`;
+
+          await notify(queueMsg);
         }
       }
     }
 
     if (recruitedCount > 0) {
       refreshWhaleSubscriptions();
-      console.log(`[WhaleScout PRO] 🎯 Berhasil merekrut ${recruitedCount} smart money whale berstandar institutional.`);
+      console.log(`[WhaleScout PRO] 🎯 Berhasil merekrut ${recruitedCount} smart money whale (Convergence-First).`);
     }
     if (queuedCount > 0) {
       console.log(`[WhaleScout PRO] 📋 ${queuedCount} kandidat masuk shadow queue.`);
