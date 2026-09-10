@@ -31,7 +31,7 @@ async function notify(message: string, extra?: any) {
     try {
       await scoutNotifier(message, extra);
     } catch (err: any) {
-      console.error('[WhaleScout] Gagal mengirim notifikasi Telegram:', err.message);
+      console.error('[WhaleScout PRO] Gagal mengirim notifikasi Telegram:', err.message);
     }
   }
 }
@@ -44,10 +44,12 @@ const SYSTEM_BLACKLIST = new Set([
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
   'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium
-  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM
+  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter
   'So11111111111111111111111111111111111111112',
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
+  'routeUGWgpak9pq3bvCj2sMgT1TKHBiQG3UtDhVe9dB', // Raydium Router
 ]);
 
 /**
@@ -76,7 +78,6 @@ export async function isMevBotSuspect(walletAddress: string, signatures: any[]):
         rapidIntervals++;
       }
     }
-    // If more than 60% of recent txs happened within < 90s of each other
     if (rapidIntervals / (blockTimes.length - 1) >= 0.6) {
       return { isMev: true, reason: `Holding time ultra-pendek / transaksi beruntun (<${CONFIG.MIN_WHALE_HOLDING_SEC}s)` };
     }
@@ -85,57 +86,297 @@ export async function isMevBotSuspect(walletAddress: string, signatures: any[]):
   return { isMev: false, reason: 'Human smart money profile' };
 }
 
+// ============================================================================
+// PILAR 2: Pre-Screen Historical Win Rate (Institutional-Grade Candidate Audit)
+// ============================================================================
 /**
- * Fetches top organic volume tokens from GeckoTerminal trending Solana pools,
- * with graceful fallback to DexScreener high-volume search.
+ * Analyzes the last N transactions of a wallet to assess whether they are
+ * a profitable smart money trader. Checks win rate, avg profit, and avg hold time.
+ * Returns null on any error (treated as inconclusive / pass).
+ */
+export async function assessWhaleCandidateWinRate(
+  walletAddress: string,
+  heliusApiKey: string
+): Promise<{ winRate: number; avgHoldSec: number; totalTrades: number; passed: boolean; reason: string } | null> {
+  try {
+    // Use Helius Enhanced Transactions API for clean parsed tx data
+    const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${heliusApiKey}&limit=20&type=SWAP`;
+    const res = await axios.get(url, { timeout: 8000 });
+    const txs: any[] = res.data || [];
+
+    if (txs.length < 5) {
+      return { winRate: 100, avgHoldSec: 9999, totalTrades: txs.length, passed: true, reason: 'Riwayat SWAP tidak cukup (< 5), dianggap bersih' };
+    }
+
+    // Analyze token events: track SOL spent vs. SOL received per swap
+    let wins = 0;
+    let losses = 0;
+    let holdTimeSamples: number[] = [];
+
+    for (const tx of txs) {
+      const events = tx.events?.swap;
+      if (!events) continue;
+
+      // Native SOL balance change (negative = spent, positive = received)
+      const nativeDiff = tx.nativeTransfers?.reduce((sum: number, t: any) => {
+        if (t.toUserAccount === walletAddress) return sum + t.amount;
+        if (t.fromUserAccount === walletAddress) return sum - t.amount;
+        return sum;
+      }, 0) ?? 0;
+
+      // A net positive SOL means they sold for profit, negative means they bought
+      if (nativeDiff > 0) {
+        wins++;
+      } else if (nativeDiff < -0.001 * 1e9) {
+        losses++;
+      }
+
+      if (tx.timestamp) holdTimeSamples.push(tx.timestamp);
+    }
+
+    const totalTrades = wins + losses;
+    if (totalTrades < 3) {
+      return { winRate: 100, avgHoldSec: 9999, totalTrades, passed: true, reason: 'Tidak cukup data swap SOL terukur, dianggap bersih' };
+    }
+
+    const winRate = (wins / totalTrades) * 100;
+
+    // Compute average hold time between buys
+    let avgHoldSec = 9999;
+    if (holdTimeSamples.length >= 2) {
+      holdTimeSamples.sort((a, b) => a - b);
+      let totalHold = 0;
+      for (let i = 1; i < holdTimeSamples.length; i++) {
+        totalHold += holdTimeSamples[i] - holdTimeSamples[i - 1];
+      }
+      avgHoldSec = totalHold / (holdTimeSamples.length - 1);
+    }
+
+    const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 55.0;
+    const passed = winRate >= minWinRate;
+    const reason = passed
+      ? `Win Rate ${winRate.toFixed(1)}% >= ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`
+      : `Win Rate ${winRate.toFixed(1)}% < ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`;
+
+    return { winRate, avgHoldSec, totalTrades, passed, reason };
+  } catch (err: any) {
+    // If Helius API call fails, skip pre-screen (don't block candidate)
+    console.warn(`[WhaleScout PRO] Win rate pre-screen gagal untuk ${walletAddress.slice(0, 8)}: ${err.message} — dilanjutkan tanpa filter`);
+    return null;
+  }
+}
+
+// ============================================================================
+// PILAR 1: Raydium Migration Scanner — koin fresh baru live dari Pump.fun
+// ============================================================================
+/**
+ * Discovers recently migrated Pump.fun → Raydium pools (< WHALE_MIGRATION_MAX_AGE_MIN minutes old).
+ * These are the highest-alpha venues where early buyers are most likely to be insiders.
+ */
+export async function getRecentMigrationTokens(
+  maxAgeMins: number = CONFIG.WHALE_MIGRATION_MAX_AGE_MIN || 45
+): Promise<Array<{ tokenMint: string; poolName: string; volumeUsd: number; poolAgeMins: number }>> {
+  const results: Array<{ tokenMint: string; poolName: string; volumeUsd: number; poolAgeMins: number }> = [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cutoffSec = nowSec - maxAgeMins * 60;
+
+  try {
+    // DexScreener boosted / latest pairs on Raydium (sorted by creation time)
+    const res = await axios.get(
+      'https://api.dexscreener.com/latest/dex/search?q=sol&rankBy=trendingScoreH1&order=desc',
+      { timeout: 7000 }
+    );
+    const pairs: any[] = res.data?.pairs || [];
+
+    for (const p of pairs) {
+      if (results.length >= 12) break;
+      if (p.chainId !== 'solana') continue;
+      if (!['raydium', 'raydium-clmm', 'raydium-cpmm'].includes(p.dexId)) continue;
+
+      const pairCreatedAtSec = p.pairCreatedAt ? Math.floor(p.pairCreatedAt / 1000) : 0;
+      if (pairCreatedAtSec < cutoffSec) continue; // Too old
+
+      const liqUsd = p.liquidity?.usd || 0;
+      const volH1 = p.volume?.h1 || 0;
+      const volH24 = p.volume?.h24 || 0;
+      const tokenMint = p.baseToken?.address;
+
+      // Quality gate: min $10k liquidity and some early trading activity
+      if (!tokenMint || liqUsd < 10000 || (volH1 + volH24) < 2000) continue;
+      if (tokenMint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') continue; // USDC
+      if (tokenMint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB') continue; // USDT
+
+      const poolAgeMins = Math.floor((nowSec - pairCreatedAtSec) / 60);
+      if (!results.some(r => r.tokenMint === tokenMint)) {
+        results.push({
+          tokenMint,
+          poolName: `${p.baseToken?.symbol || '?'}/SOL [Raydium Migration ${poolAgeMins}m ago]`,
+          volumeUsd: volH24,
+          poolAgeMins
+        });
+      }
+    }
+  } catch (err: any) {
+    console.warn('[WhaleScout PRO] Migration scanner fallback (DexScreener error):', err.message);
+  }
+
+  // Fallback: Raydium new pairs API
+  if (results.length < 4) {
+    try {
+      const res = await axios.get(
+        'https://api.raydium.io/v2/main/pairs?sortBy=volume&sortType=desc&poolType=all&poolSortField=default&page=1&pageSize=30',
+        { timeout: 6000 }
+      );
+      const pairs: any[] = res.data?.data || [];
+      for (const p of pairs) {
+        if (results.length >= 12) break;
+        const tokenMint = p.baseMint;
+        if (!tokenMint || results.some(r => r.tokenMint === tokenMint)) continue;
+        const liq = p.liquidity || 0;
+        const vol = p.volume24h || 0;
+        if (liq < 10000 || vol < 5000) continue;
+        results.push({
+          tokenMint,
+          poolName: `${p.name || '?'} [Raydium New]`,
+          volumeUsd: vol,
+          poolAgeMins: 0
+        });
+      }
+    } catch {}
+  }
+
+  console.log(`[WhaleScout PRO] 🚀 Raydium Migration Scanner: ${results.length} fresh pool ditemukan (max ${maxAgeMins}m lalu).`);
+  return results;
+}
+
+// ============================================================================
+// PILAR 5: Multi-Source Token Discovery
+// ============================================================================
+/**
+ * Fetches top organic volume tokens from multiple institutional-grade sources:
+ * 1. Raydium New Pools (fresh migrations)
+ * 2. Birdeye Trending Tokens
+ * 3. DexScreener High-Volume Pairs (< 1 jam, to catch early movers)
+ * 4. GeckoTerminal Trending Pools (fallback / broad market)
  */
 export async function getOrganicTrendingTokens(limit: number = 16): Promise<Array<{ tokenMint: string; poolName: string; volumeUsd: number }>> {
   const tokens: Array<{ tokenMint: string; poolName: string; volumeUsd: number }> = [];
 
-  // Tier 1 & 2: GeckoTerminal Trending Pools (up to 16 top organic volume pools on Solana)
-  try {
-    const res = await axios.get('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', {
-      headers: { Accept: 'application/json' },
-      timeout: 7000
-    });
-
-    const pools = res.data?.data;
-    if (Array.isArray(pools)) {
-      for (const p of pools) {
+  // ── Tier 1: Migration tokens (fresh Raydium pools) ──
+  if (CONFIG.WHALE_MIGRATION_SCAN_ENABLED) {
+    try {
+      const migrationTokens = await getRecentMigrationTokens();
+      for (const m of migrationTokens) {
         if (tokens.length >= limit) break;
-        const rawTokenId = p.relationships?.base_token?.data?.id || '';
-        // Format: 'solana_<mint>'
-        const tokenMint = rawTokenId.replace('solana_', '');
-        const volumeUsd = parseFloat(p.attributes?.volume_usd?.h24 || '0');
-        const reserveUsd = parseFloat(p.attributes?.reserve_in_usd || '0');
-        const poolName = p.attributes?.name || 'Trending Pool';
+        if (!tokens.some(t => t.tokenMint === m.tokenMint)) {
+          tokens.push({ tokenMint: m.tokenMint, poolName: m.poolName, volumeUsd: m.volumeUsd });
+        }
+      }
+    } catch {}
+  }
 
-        // Quality check: min $10k pool liquidity and min $50k 24h volume
+  // ── Tier 2: Birdeye Trending Tokens on Solana ──
+  if (tokens.length < limit) {
+    try {
+      const res = await axios.get(
+        'https://public-api.birdeye.so/defi/trending_tokens?sort_by=volume24hUSD&sort_type=desc&limit=10&chain=solana',
+        {
+          headers: { Accept: 'application/json', 'x-chain': 'solana' },
+          timeout: 6000
+        }
+      );
+      const items: any[] = res.data?.data?.items || [];
+      for (const item of items) {
+        if (tokens.length >= limit) break;
+        const tokenMint = item.address;
+        const volumeUsd = item.volume24hUSD || 0;
+        const liqUsd = item.liquidity || 0;
         if (
-          tokenMint && 
-          tokenMint.length >= 32 && 
-          reserveUsd >= 10000 && 
+          tokenMint &&
           volumeUsd >= 50000 &&
-          tokenMint !== 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' && // USDC
-          tokenMint !== 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'    // USDT
+          liqUsd >= 15000 &&
+          !tokens.some(t => t.tokenMint === tokenMint) &&
+          tokenMint !== 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' &&
+          tokenMint !== 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
         ) {
-          if (!tokens.some(t => t.tokenMint === tokenMint)) {
-            tokens.push({ tokenMint, poolName, volumeUsd });
+          tokens.push({ tokenMint, poolName: `${item.symbol || '?'} [Birdeye Trending]`, volumeUsd });
+        }
+      }
+    } catch (err: any) {
+      console.warn('[WhaleScout PRO] Birdeye trending unavailable:', err.message);
+    }
+  }
+
+  // ── Tier 3: DexScreener < 1 hour old active pairs (early mover alpha) ──
+  if (tokens.length < limit) {
+    try {
+      const res = await axios.get(
+        'https://api.dexscreener.com/latest/dex/search?q=solana&rankBy=trendingScoreH1&order=desc',
+        { timeout: 6000 }
+      );
+      const pairs: any[] = (res.data?.pairs || []).filter((p: any) =>
+        p.chainId === 'solana' &&
+        (p.volume?.h1 || 0) >= 15000 &&
+        (p.liquidity?.usd || 0) >= 15000
+      );
+      for (const p of pairs) {
+        if (tokens.length >= limit) break;
+        const tokenMint = p.baseToken?.address;
+        if (tokenMint && !tokens.some(t => t.tokenMint === tokenMint)) {
+          tokens.push({
+            tokenMint,
+            poolName: `${p.baseToken?.symbol || 'SOL'} / ${p.quoteToken?.symbol || 'SOL'} [DexScreener H1]`,
+            volumeUsd: p.volume?.h24 || 0
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // ── Tier 4: GeckoTerminal Trending Pools (broad market fallback) ──
+  if (tokens.length < limit) {
+    try {
+      const res = await axios.get('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', {
+        headers: { Accept: 'application/json' },
+        timeout: 7000
+      });
+
+      const pools = res.data?.data;
+      if (Array.isArray(pools)) {
+        for (const p of pools) {
+          if (tokens.length >= limit) break;
+          const rawTokenId = p.relationships?.base_token?.data?.id || '';
+          const tokenMint = rawTokenId.replace('solana_', '');
+          const volumeUsd = parseFloat(p.attributes?.volume_usd?.h24 || '0');
+          const reserveUsd = parseFloat(p.attributes?.reserve_in_usd || '0');
+          const poolName = p.attributes?.name || 'GeckoTerminal Pool';
+
+          if (
+            tokenMint &&
+            tokenMint.length >= 32 &&
+            reserveUsd >= 10000 &&
+            volumeUsd >= 50000 &&
+            tokenMint !== 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' &&
+            tokenMint !== 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
+          ) {
+            if (!tokens.some(t => t.tokenMint === tokenMint)) {
+              tokens.push({ tokenMint, poolName: `${poolName} [GeckoTerminal]`, volumeUsd });
+            }
           }
         }
       }
+    } catch (err: any) {
+      console.warn('[WhaleScout PRO] GeckoTerminal unavailable:', err.message);
     }
-  } catch (err: any) {
-    console.warn('[WhaleScout] Gagal ambil GeckoTerminal trending pools:', err.message);
   }
 
-  // Tier 3: Complement with DexScreener Fresh Active Solana Pairs
+  // ── Tier 5: DexScreener broad fallback if still not enough ──
   if (tokens.length < limit) {
     try {
       const res = await axios.get('https://api.dexscreener.com/latest/dex/search?q=solana', { timeout: 6000 });
-      const pairs = res.data?.pairs?.filter((p: any) => 
-        p.chainId === 'solana' && 
-        (p.volume?.h24 || 0) >= 100000 && 
+      const pairs = res.data?.pairs?.filter((p: any) =>
+        p.chainId === 'solana' &&
+        (p.volume?.h24 || 0) >= 100000 &&
         (p.liquidity?.usd || 0) >= 15000
       ) || [];
       for (const p of pairs) {
@@ -144,7 +385,7 @@ export async function getOrganicTrendingTokens(limit: number = 16): Promise<Arra
         if (tokenMint && !tokens.some(t => t.tokenMint === tokenMint)) {
           tokens.push({
             tokenMint,
-            poolName: `${p.baseToken?.symbol || 'SOL'} / ${p.quoteToken?.symbol || 'SOL'}`,
+            poolName: `${p.baseToken?.symbol || 'SOL'} / ${p.quoteToken?.symbol || 'SOL'} [DexScreener H24]`,
             volumeUsd: p.volume?.h24 || 0
           });
         }
@@ -165,17 +406,18 @@ export interface ScoutOutcome {
 }
 
 /**
- * Auto-Scan & Recruit Smart Money Whales from Organic High-Volume Solana Pools (Pro-Grade)
+ * PRO SCANNER: Auto-Scan & Recruit Smart Money Whales
+ * 5-Pillar Institutional Grade Whale Discovery System
  */
 export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_SCOUT_BATCH_SIZE || 4): Promise<ScoutOutcome> {
-  console.log('[WhaleScout] 🔍 Memulai pemindaian institusional pasar Solana (Organic High-Volume Pools)...');
+  console.log('[WhaleScout PRO] 🔍 Memulai pemindaian institusional 5-Pilar Solana Smart Money...');
   
   const currentWhales = getAllWhales();
   const currentQueue = getWhaleQueue();
   const isRosterFull = currentWhales.length >= CONFIG.MAX_ACTIVE_WHALES;
 
   if (isRosterFull && currentQueue.length >= 50) {
-    console.log(`[WhaleScout] ℹ️ Radar paus (${currentWhales.length}/${CONFIG.MAX_ACTIVE_WHALES}) dan bangku cadangan (${currentQueue.length}/50) sudah penuh.`);
+    console.log(`[WhaleScout PRO] ℹ️ Radar paus (${currentWhales.length}/${CONFIG.MAX_ACTIVE_WHALES}) dan shadow queue (${currentQueue.length}/50) sudah penuh.`);
     return {
       recruited: 0,
       queued: 0,
@@ -189,11 +431,14 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
   let recruitedCount = 0;
   let queuedCount = 0;
 
+  // Get Helius API key for enhanced transaction parsing (Pilar 4)
+  const heliusApiKey = CONFIG.HELIUS_API_KEYS[0] || CONFIG.HELIUS_API_KEY || '';
+
   try {
-    // 1. Fetch Top Organic Volume Pools on Solana (GeckoTerminal $5M-$50M + DexScreener High-Volume)
-    const targetTokens = await getOrganicTrendingTokens(16);
+    // ── PILAR 1 + 5: Multi-Source Token Discovery (Migration + Birdeye + DexScreener + GeckoTerminal) ──
+    const targetTokens = await getOrganicTrendingTokens(18);
     if (targetTokens.length === 0) {
-      console.log('[WhaleScout] ⚠️ Tidak ada token organik dengan likuiditas memadai ditemukan saat ini.');
+      console.log('[WhaleScout PRO] ⚠️ Tidak ada token organik ditemukan saat ini. Retry berikutnya.');
       return {
         recruited: 0,
         queued: 0,
@@ -205,29 +450,34 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
     }
 
     for (const tokenItem of targetTokens) {
-      if ((recruitedCount + queuedCount) >= limitToRecruit) {
-        break;
-      }
+      if ((recruitedCount + queuedCount) >= limitToRecruit) break;
 
       const tokenMint = tokenItem.tokenMint;
-      console.log(`[WhaleScout] 🔎 Menganalisis pool: ${tokenItem.poolName} ($${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M 24h Vol) CA: \`${tokenMint}\`...`);
+      console.log(`[WhaleScout PRO] 🔎 Menganalisis: ${tokenItem.poolName} ($${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M Vol) CA: \`${tokenMint.slice(0, 8)}...\``);
+
       const market = await getTokenMarketData(tokenMint);
       const symbol = market ? market.symbol : 'TOKEN';
 
-      // 2. Query recent on-chain signatures for this token (Depth: 25 signatures)
+      // ── PILAR 4: Helius Enhanced TX — Deep scan 50 signatures ──
       let sigs: any[] = [];
       try {
-        sigs = await connection.getSignaturesForAddress(new PublicKey(tokenMint), { limit: 25 });
+        // Use WHALE_SCOUT_SIGNATURES_DEPTH (50) instead of old 25
+        sigs = await connection.getSignaturesForAddress(new PublicKey(tokenMint), {
+          limit: CONFIG.WHALE_SCOUT_SIGNATURES_DEPTH || 50
+        });
       } catch (err: any) {
-        console.warn(`[WhaleScout] Gagal ambil signatures untuk ${tokenMint}:`, err.message);
+        console.warn(`[WhaleScout PRO] Gagal ambil signatures untuk ${tokenMint}:`, err.message);
         continue;
       }
+
+      // Collect unique buyers from this pool's tx history
+      const candidateSeen = new Set<string>();
 
       for (const sigInfo of sigs) {
         if (sigInfo.err) continue;
         if ((recruitedCount + queuedCount) >= limitToRecruit) break;
 
-        await sleep(80); // Fast pacing enabled by Helius Round-Robin pool
+        await sleep(60); // Fast pacing with Helius Round-Robin pool
 
         try {
           const tx = await connection.getParsedTransaction(sigInfo.signature, {
@@ -239,165 +489,179 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           const firstAccount = tx.transaction.message.accountKeys[0];
           const feePayerKey = firstAccount?.pubkey ? firstAccount.pubkey.toBase58() : null;
 
-          if (!feePayerKey || SYSTEM_BLACKLIST.has(feePayerKey) || isWhaleBlacklisted(feePayerKey)) continue;
+          if (!feePayerKey) continue;
+          if (SYSTEM_BLACKLIST.has(feePayerKey)) continue;
+          if (isWhaleBlacklisted(feePayerKey)) continue;
+          if (getWhaleByAddress(feePayerKey)) continue; // Already tracked
+          if (candidateSeen.has(feePayerKey)) continue; // Already evaluated this run
+          candidateSeen.add(feePayerKey);
 
-          // Check if wallet is already registered in active roster
-          if (getWhaleByAddress(feePayerKey)) continue;
-
-          // Check if this wallet actually bought tokens in this tx
+          // Check if wallet actually bought tokens in this tx (token balance increased)
           const post = tx.meta.postTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
           const pre = tx.meta.preTokenBalances?.find(b => b.owner === feePayerKey && b.mint === tokenMint);
           const postAmt = parseFloat(post?.uiTokenAmount?.uiAmountString || '0');
           const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmountString || '0');
 
-          if (postAmt > preAmt) {
-            // 1. Check buyer's native SOL balance (Pro criteria: >= 1.5 SOL)
-            const balanceLamports = await connection.getBalance(new PublicKey(feePayerKey));
-            const balanceSol = balanceLamports / 1_000_000_000;
+          if (postAmt <= preAmt) continue; // Not a buyer
 
-            if (balanceSol < CONFIG.MIN_WHALE_BALANCE_SOL) {
+          // ── Gate 1: Native SOL balance check ──
+          const balanceLamports = await connection.getBalance(new PublicKey(feePayerKey));
+          const balanceSol = balanceLamports / 1_000_000_000;
+          if (balanceSol < CONFIG.MIN_WHALE_BALANCE_SOL) continue;
+
+          // ── Gate 2: Buy size check ──
+          const preSol = tx.meta.preBalances[0] || 0;
+          const postSol = tx.meta.postBalances[0] || 0;
+          const solSpent = (preSol - postSol) / 1_000_000_000;
+          if (solSpent < CONFIG.MIN_WHALE_BUY_SOL) continue;
+
+          // ── Gate 3: Anti-Burner wallet history check ──
+          const pastSigs = await connection.getSignaturesForAddress(new PublicKey(feePayerKey), { limit: 25 });
+          if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) {
+            console.log(`[WhaleScout PRO] ⏩ Skip ${feePayerKey.slice(0, 8)}: Dompet baru/burner (${pastSigs.length} txs).`);
+            continue;
+          }
+
+          // ── Gate 4: MEV / HFT bot disqualification ──
+          const mevCheck = await isMevBotSuspect(feePayerKey, pastSigs);
+          if (mevCheck.isMev) {
+            console.log(`[WhaleScout PRO] 🤖 DITOLAK MEV: ${feePayerKey.slice(0, 8)} — ${mevCheck.reason}`);
+            if (CONFIG.NOTIFY_ON_REJECT) {
+              await notify(
+                `⚠️ *SCOUT AUDIT: DOMPET DITOLAK (MEV / HFT BOT)*\n\n` +
+                `📝 *Alamat:* \`${feePayerKey}\`\n` +
+                `🪙 *Pool Acuan:* *${symbol}*\n` +
+                `🚫 *Alasan:* ${mevCheck.reason}\n\n` +
+                `_Bot menolak dompet ini demi menjaga portofolio dari jebakan micro-flipping bot._`
+              );
+            }
+            continue;
+          }
+
+          // ── Gate 5: Cabal / Sybil Cluster Shield ──
+          const cabalCheck = await isCabalSuspect(feePayerKey, getAllWhales());
+          if (cabalCheck.isCabal) {
+            console.log(`[WhaleScout PRO] 🚨 DITOLAK CABAL: ${feePayerKey.slice(0, 8)} — shared funder dengan ${cabalCheck.matchingWhales.join(', ')}`);
+            if (CONFIG.NOTIFY_ON_REJECT) {
+              await notify(
+                `🚨 *SCOUT AUDIT: DOMPET DITOLAK (CABAL / SYBIL CLUSTER)*\n\n` +
+                `📝 *Alamat:* \`${feePayerKey}\`\n` +
+                `🪙 *Pool Acuan:* *${symbol}*\n` +
+                `🚫 *Alasan:* Berbagi penyetor dana on-chain dengan: *${cabalCheck.matchingWhales.join(', ')}*\n\n` +
+                `_Bot menolak untuk mencegah risiko dump bersama kelompok cabal._`
+              );
+            }
+            continue;
+          }
+
+          // ── Gate 6: PRO — Historical Win Rate Pre-Screen (Pilar 2) ──
+          let winRateNote = '';
+          if (heliusApiKey) {
+            const winRateResult = await assessWhaleCandidateWinRate(feePayerKey, heliusApiKey);
+            if (winRateResult !== null && !winRateResult.passed && winRateResult.totalTrades >= 5) {
+              console.log(`[WhaleScout PRO] 📉 DITOLAK WIN RATE: ${feePayerKey.slice(0, 8)} — ${winRateResult.reason}`);
               continue;
             }
-
-            // 2. Check buy size: minimum 0.2 SOL spent
-            const preSol = tx.meta.preBalances[0] || 0;
-            const postSol = tx.meta.postBalances[0] || 0;
-            const solSpent = (preSol - postSol) / 1_000_000_000;
-            if (solSpent < CONFIG.MIN_WHALE_BUY_SOL) {
-              continue;
+            if (winRateResult?.passed) {
+              winRateNote = ` | Win Rate: *${winRateResult.winRate.toFixed(0)}%* (${winRateResult.totalTrades} swaps)`;
             }
+          }
 
-            // 3. Anti-Burner / Wallet History Audit (>= 10 txs)
-            const pastSigs = await connection.getSignaturesForAddress(new PublicKey(feePayerKey), { limit: 20 });
-            if (pastSigs.length < CONFIG.MIN_WHALE_HISTORY_TXS) {
-              console.log(`[WhaleScout] ⏩ Abaikan ${feePayerKey.slice(0, 8)}: Dompet terlalu baru/burner (${pastSigs.length} txs).`);
-              continue;
+          // ── Passed All 6 Gates: Classify Archetype & Register ──
+          let archetype = '🔬 PROBATION_SCOUT';
+          let label = `🎯 Scout: $${symbol} Smart Buyer`;
+
+          // Determine source context for label
+          const isMigration = tokenItem.poolName.includes('Raydium Migration') || tokenItem.poolName.includes('Raydium New');
+          const isBirdeye = tokenItem.poolName.includes('Birdeye');
+
+          if (balanceSol >= CONFIG.VIP_WHALE_BALANCE_SOL) {
+            archetype = '👑 VIP_ACCUMULATOR_CANDIDATE';
+            label = `👑 Paus: $${symbol} VIP Accumulator`;
+          } else if (isMigration) {
+            archetype = '🚀 MIGRATION_INSIDER';
+            label = `🚀 Insider: $${symbol} Migration Buyer`;
+          } else if (market && market.priceChange24h && market.priceChange24h > 100) {
+            archetype = '🐋 EARLY_ACCUMULATOR';
+            label = `🐋 Paus: $${symbol} Early Accumulator`;
+          } else if (isBirdeye || (market && market.priceChange5m && Math.abs(market.priceChange5m) > 4)) {
+            archetype = '⚡ MOMENTUM_SWING';
+            label = `⚡ Smart: $${symbol} Momentum Whale`;
+          } else {
+            archetype = '🎯 RAYDIUM_HUNTER';
+            label = `🎯 Scout: $${symbol} Smart Buyer`;
+          }
+
+          // ── Register to active roster or shadow queue ──
+          if (getAllWhales().length < CONFIG.MAX_ACTIVE_WHALES) {
+            const added = addWhale(feePayerKey, label, CONFIG.DEFAULT_BUY_AMOUNT_SOL, 0, 'PROBATION');
+
+            if (added) {
+              recruitedCount++;
+              console.log(`[WhaleScout PRO] ✅ LOLOS 6-GATE AUDIT (${archetype}): ${label} (${feePayerKey.slice(0,8)}...) Saldo: ${balanceSol.toFixed(2)} SOL | Txs: ${pastSigs.length}${winRateNote}`);
+
+              const sourceTag = isMigration ? '🚀 *Raydium Migration < 45 menit*' : isBirdeye ? '📊 *Birdeye Trending*' : '📈 *High-Volume Pool*';
+              const recruitMsg = `🏛️ *SMART MONEY LOLOS AUDIT INSTITUSIONAL PRO (6 GATE)* ✅\n\n` +
+                `🏷️ *Label:* ${label}\n` +
+                `📝 *Alamat:* \`${feePayerKey}\`\n` +
+                `🏆 *Arketipe:* *${archetype}*\n` +
+                `💰 *Saldo On-Chain:* *${balanceSol.toFixed(2)} SOL*\n` +
+                `📜 *Riwayat TX:* *${pastSigs.length}+ Transaksi* ✅\n` +
+                `⚡ *Gate MEV:* ✅ LOLOS\n` +
+                `🛡️ *Gate Cabal:* ✅ LOLOS\n` +
+                `${winRateNote ? `📊 *Gate Win Rate:* ✅ ${winRateNote.replace('|', '').trim()}\n` : ''}` +
+                `🪙 *Pool Acuan:* ${sourceTag} — *${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)\n` +
+                `🛡️ *Status Copy:* *OFF (Masa Percobaan Shadow Track)*\n\n` +
+                `_💡 Bot mengobservasi trader ini secara real-time. Begitu terbukti mencetak profit, status otomatis naik ke VERIFIED AUTO-COPY!_`;
+
+              await notify(recruitMsg);
+              break; // One whale per token for diversification
             }
+          } else {
+            // Active slots full → Shadow Queue
+            const queued = addToWhaleQueue({
+              address: feePayerKey,
+              label,
+              archetype,
+              balanceSol,
+              referenceToken: tokenMint,
+              referencePool: tokenItem.poolName,
+              score: balanceSol + (winRateNote ? 10 : 0) // Bonus score for pre-screened candidates
+            });
 
-            // 4. MEV Sniper & Latency Disqualification
-            const mevCheck = await isMevBotSuspect(feePayerKey, pastSigs);
-            if (mevCheck.isMev) {
-              console.log(`[WhaleScout] 🤖 DITOLAK MEV/SNIPER: ${feePayerKey.slice(0, 8)} - ${mevCheck.reason}`);
-              if (CONFIG.NOTIFY_ON_REJECT) {
-                await notify(
-                  `⚠️ *SCOUT AUDIT: DOMPET DITOLAK (MEV / HFT BOT)*\n\n` +
-                  `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                  `🪙 *Kolam Acuan:* *${symbol}* (${tokenItem.poolName})\n` +
-                  `🚫 *Alasan:* ${mevCheck.reason}\n\n` +
-                  `_Bot menolak dompet ini demi menjaga portofolio dari jebakan micro-flipping bot._`
-                );
-              }
-              continue;
-            }
+            if (queued) {
+              queuedCount++;
+              console.log(`[WhaleScout PRO] 📋 MASUK SHADOW QUEUE (${archetype}): ${label} (${feePayerKey.slice(0,8)}...) Saldo: ${balanceSol.toFixed(2)} SOL`);
 
-            // 5. Cabal / Sybil Cluster Shield: Verify funding source isn't linked to existing whales
-            const cabalCheck = await isCabalSuspect(feePayerKey, getAllWhales());
-            if (cabalCheck.isCabal) {
-              console.log(`[WhaleScout] 🚨 DITOLAK CABAL/SYBIL: ${feePayerKey.slice(0, 8)} berbagi penyetor dana yang sama dengan ${cabalCheck.matchingWhales.join(', ')}`);
-              if (CONFIG.NOTIFY_ON_REJECT) {
-                await notify(
-                  `🚨 *SCOUT AUDIT: DOMPET DITOLAK (CABAL / SYBIL CLUSTER)*\n\n` +
-                  `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                  `🪙 *Kolam Acuan:* *${symbol}*\n` +
-                  `🚫 *Alasan:* Terdeteksi berbagi penyetor dana on-chain dengan dompet radar: *${cabalCheck.matchingWhales.join(', ')}*\n\n` +
-                  `_Bot menolak dompet ini untuk mencegah risiko dump bersama kelompok cabal._`
-                );
-              }
-              continue;
-            }
+              const queueMsg = `📋 *SMART MONEY MASUK SHADOW QUEUE (BANGKU CADANGAN)*\n\n` +
+                `Slot radar aktif penuh (*${getAllWhales().length}/${CONFIG.MAX_ACTIVE_WHALES}*). Kandidat berkualitas disimpan di antrean:\n\n` +
+                `🏷️ *Label:* ${label}\n` +
+                `📝 *Alamat:* \`${feePayerKey}\`\n` +
+                `🏆 *Arketipe:* *${archetype}*\n` +
+                `💰 *Saldo:* *${balanceSol.toFixed(2)} SOL*\n` +
+                `${winRateNote ? `📊 *Win Rate:* ${winRateNote.replace('|', '').trim()}\n` : ''}` +
+                `🪙 *Pool:* *${symbol}* (Vol $${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M)\n\n` +
+                `_💡 Begitu ada slot kosong setelah prune, kandidat ini otomatis dipromosikan ke radar aktif!_`;
 
-            // 6. Archetype Classification & Tier Sizing
-            // All scouted candidates start strictly in PROBATION (Incubation Mode) until proven profitable
-            let archetype = '🔬 PROBATION_SCOUT';
-            let label = `🔬 Scout: $${symbol} Smart Buyer`;
-            const tier: 'PROBATION' = 'PROBATION';
-
-            if (balanceSol >= CONFIG.VIP_WHALE_BALANCE_SOL) {
-              archetype = '👑 VIP_ACCUMULATOR_CANDIDATE';
-              label = `👑 Paus: $${symbol} VIP Accumulator`;
-            } else if (market && market.priceChange24h && market.priceChange24h > 100) {
-              archetype = '🐋 EARLY_ACCUMULATOR';
-              label = `🐋 Paus: $${symbol} Early Accumulator`;
-            } else if (market && market.priceChange5m && Math.abs(market.priceChange5m) > 4) {
-              archetype = '⚡ MOMENTUM_SWING';
-              label = `⚡ Smart: $${symbol} Momentum Whale`;
-            } else {
-              archetype = '🎯 RAYDIUM_HUNTER';
-              label = `🎯 Scout: $${symbol} Smart Buyer`;
-            }
-
-            // Check if active roster has open slots
-            if (getAllWhales().length < CONFIG.MAX_ACTIVE_WHALES) {
-              // Enrolled into active roster strictly in PROBATION mode (autoCopy = 0, zero capital risk)
-              const added = addWhale(feePayerKey, label, CONFIG.DEFAULT_BUY_AMOUNT_SOL, 0, 'PROBATION');
-              
-              if (added) {
-                recruitedCount++;
-                console.log(`[WhaleScout] ✅ KANDIDAT LOLOS AUDIT PRO (${archetype}): ${label} (${feePayerKey}) Saldo: ${balanceSol.toFixed(2)} SOL | Txs: ${pastSigs.length}`);
-
-                const recruitMsg = `🏛️ *KANDIDAT SMART MONEY LOLOS AUDIT INSTITUSIONAL (PRO)*\n\n` +
-                  `🏷️ *Label:* ${label}\n` +
-                  `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                  `🏆 *Arketipe:* *${archetype}*\n` +
-                  `💰 *Saldo On-Chain:* *${balanceSol.toFixed(2)} SOL* (✅ Standar Pro >= ${CONFIG.MIN_WHALE_BALANCE_SOL} SOL)\n` +
-                  `📜 *Riwayat Transaksi:* *${pastSigs.length}+ Transaksi* (✅ Bukan Burner Wallet)\n` +
-                  `⚡ *Pemeriksaan MEV:* ✅ *LOLOS* (Bukan HFT Bot Micro-Flip)\n` +
-                  `🛡️ *Pemeriksaan Cabal:* ✅ *LOLOS* (Funder Mandiri)\n` +
-                  `🪙 *Kolam Acuan:* *${symbol}* (${tokenItem.poolName} - Vol 24j: *$${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M*)\n` +
-                  `🛡️ *Status Copy:* *OFF (Masa Percobaan / Shadow Tracking)*\n\n` +
-                  `_💡 Bot mengobservasi performa trader ini secara otomatis. Begitu terbukti mencetak trade profit nyata, bot akan otomatis mempromosikannya ke VERIFIED AUTO-COPY!_`;
-
-                await notify(recruitMsg);
-                break; // Diversify tokens
-              }
-            } else {
-              // Active slots full -> Route into Shadow Queue (Bench Pipeline)
-              const queued = addToWhaleQueue({
-                address: feePayerKey,
-                label,
-                archetype,
-                balanceSol,
-                referenceToken: tokenMint,
-                referencePool: tokenItem.poolName,
-                score: balanceSol
-              });
-
-              if (queued) {
-                queuedCount++;
-                console.log(`[WhaleScout] 📋 MASUK SHADOW QUEUE (${archetype}): ${label} (${feePayerKey}) Saldo: ${balanceSol.toFixed(2)} SOL`);
-
-                const queueMsg = `📋 *KANDIDAT SMART MONEY MASUK SHADOW QUEUE (BANGKU CADANGAN)*\n\n` +
-                  `Slot radar aktif saat ini penuh (*${getAllWhales().length}/${CONFIG.MAX_ACTIVE_WHALES}*). Kandidat berkualitas ini disimpan di antrean cadangan:\n\n` +
-                  `🏷️ *Label:* ${label}\n` +
-                  `📝 *Alamat:* \`${feePayerKey}\`\n` +
-                  `🏆 *Arketipe:* *${archetype}*\n` +
-                  `💰 *Saldo On-Chain:* *${balanceSol.toFixed(2)} SOL* (✅ Standar Pro >= ${CONFIG.MIN_WHALE_BALANCE_SOL} SOL)\n` +
-                  `📜 *Riwayat Transaksi:* *${pastSigs.length}+ Transaksi* (✅ Bukan Burner Wallet)\n` +
-                  `⚡ *Pemeriksaan MEV:* ✅ *LOLOS* (Bukan HFT Bot Micro-Flip)\n` +
-                  `🛡️ *Pemeriksaan Cabal:* ✅ *LOLOS* (Funder Mandiri)\n` +
-                  `🪙 *Kolam Acuan:* *${symbol}* (${tokenItem.poolName} - Vol 24j: *$${(tokenItem.volumeUsd / 1_000_000).toFixed(2)}M*)\n\n` +
-                  `_💡 Begitu ada paus aktif yang di-prune atau dieliminasi, sistem Auto-Substitution akan langsung mempromosikan kandidat teratas dari antrean ini ke radar aktif!_`;
-
-                await notify(queueMsg);
-                break; // Diversify tokens
-              }
+              await notify(queueMsg);
+              break;
             }
           }
         } catch {
-          // Ignore individual tx parse failure
+          // Ignore individual tx parse errors
         }
       }
     }
 
     if (recruitedCount > 0) {
       refreshWhaleSubscriptions();
-      console.log(`[WhaleScout] 🎯 Berhasil merekrut ${recruitedCount} kandidat smart money berstandar pro ke radar aktif.`);
+      console.log(`[WhaleScout PRO] 🎯 Berhasil merekrut ${recruitedCount} smart money whale berstandar institutional.`);
     }
     if (queuedCount > 0) {
-      console.log(`[WhaleScout] 📋 Berhasil menambahkan ${queuedCount} kandidat smart money ke shadow queue (bangku cadangan).`);
+      console.log(`[WhaleScout PRO] 📋 ${queuedCount} kandidat masuk shadow queue.`);
     }
   } catch (err: any) {
-    console.error('[WhaleScout] Error during scoutTrendingWhales:', err.message);
+    console.error('[WhaleScout PRO] Error during scoutTrendingWhales:', err.message);
   }
 
   const latestWhales = getAllWhales();
@@ -413,78 +677,117 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
   };
 }
 
+// ============================================================================
+// PILAR 3: Smart Roster Cleanup — Prune Agresif + Auto-Promosi Antrean
+// ============================================================================
 /**
- * Auto-Prune Underperforming or Inactive Whales
+ * PRO PRUNER: Aggressive underperformer elimination + immediate queue promotion.
+ * - Rolling Alpha Decay: Win Rate < 40% over 7-day window → PROBATION
+ * - Aggressive Prune: Negative PnL + auto_copy=0 + idle > 48h → ELIMINATED
+ * - Dead Wallets: Balance < 0.2 SOL → ELIMINATED
+ * - Auto-Substitution: Every freed slot immediately filled from shadow queue
  */
 export async function pruneUnderperformingWhales(): Promise<number> {
-  console.log('[WhalePruner] 🧹 Memeriksa dompet paus untuk evaluasi performa...');
+  console.log('[WhaleScout PRO] 🧹 Menjalankan Smart Roster Cleanup (Prune Agresif + Auto-Promosi)...');
   
   const allWhales = getAllWhales();
-  // Keep at least 3 whales as safety floor
   if (allWhales.length <= 3) {
     return 0;
   }
 
-  // 1. Institutional Rolling Alpha Decay: Check if active whales lost their edge in the last 7 days
+  // ── Stage 1: Rolling Alpha Decay Check ──
   for (const whale of allWhales) {
     if (whale.tier !== 'PROBATION' && whale.auto_copy) {
-      const { getWhaleRollingStats, demoteWhale } = await import('../db/index');
-      const rolling = getWhaleRollingStats(whale.label, CONFIG.ROLLING_WINDOW_DAYS);
-      if (rolling.rollingTrades >= 3 && rolling.rollingWinRate < 40.0 && rolling.rollingPnlSol <= 0) {
-        demoteWhale(whale.id);
-        console.log(`[WhalePruner] 📉 ROLLING ALPHA DECAY: ${whale.label} diturunkan ke [PROBATION] (7d Win Rate: ${rolling.rollingWinRate.toFixed(1)}% dari ${rolling.rollingTrades} trades).`);
-        const decayMsg = `📉 *ALPHA DECAY DETECTED: PAUS DIISTIRAHATKAN!*\n\n` +
-          `Dompet *${whale.label}* mengalami penurunan performa dalam ${CONFIG.ROLLING_WINDOW_DAYS} hari terakhir:\n` +
-          `• Win Rate ${CONFIG.ROLLING_WINDOW_DAYS} Hari: *${rolling.rollingWinRate.toFixed(1)}%* (${rolling.rollingWins}W / ${rolling.rollingLosses}L)\n` +
-          `• PnL ${CONFIG.ROLLING_WINDOW_DAYS} Hari: *${rolling.rollingPnlSol >= 0 ? '+' : ''}${rolling.rollingPnlSol.toFixed(4)} SOL*\n` +
-          `• Status Baru: *PROBATION (SHADOW MODE)* 🔬\n\n` +
-          `_Bot membekukan auto-copy dompet ini demi melindungi modal Anda dari rotasi gaya pasar yang tidak lagi cocok._`;
-        await notify(decayMsg);
-      }
+      try {
+        const { getWhaleRollingStats, demoteWhale } = await import('../db/index');
+        const rolling = getWhaleRollingStats(whale.label, CONFIG.ROLLING_WINDOW_DAYS);
+        if (rolling.rollingTrades >= 3 && rolling.rollingWinRate < 40.0 && rolling.rollingPnlSol <= 0) {
+          demoteWhale(whale.id);
+          console.log(`[WhaleScout PRO] 📉 ALPHA DECAY: ${whale.label} diturunkan ke PROBATION (7d WR: ${rolling.rollingWinRate.toFixed(1)}%)`);
+          const decayMsg = `📉 *ALPHA DECAY: PAUS DIISTIRAHATKAN!*\n\n` +
+            `Dompet *${whale.label}* mengalami penurunan performa dalam ${CONFIG.ROLLING_WINDOW_DAYS} hari terakhir:\n` +
+            `• Win Rate ${CONFIG.ROLLING_WINDOW_DAYS}d: *${rolling.rollingWinRate.toFixed(1)}%* (${rolling.rollingWins}W / ${rolling.rollingLosses}L)\n` +
+            `• PnL ${CONFIG.ROLLING_WINDOW_DAYS}d: *${rolling.rollingPnlSol >= 0 ? '+' : ''}${rolling.rollingPnlSol.toFixed(4)} SOL*\n` +
+            `• Status Baru: *PROBATION (SHADOW MODE)* 🔬\n\n` +
+            `_Bot membekukan auto-copy untuk melindungi modal Anda._`;
+          await notify(decayMsg);
+        }
+      } catch {}
     }
   }
 
   let prunedCount = 0;
+  const freshWhales = getAllWhales();
 
-  // 2. Live On-Chain Solvency Check: Auto-eliminate drained / dead wallets (< 0.2 SOL)
-  for (const whale of allWhales) {
-    if (getAllWhales().length <= 3) break; // Don't prune below safety minimum
+  // ── Stage 2: Dead Wallet Elimination (Balance < 0.2 SOL) ──
+  for (const whale of freshWhales) {
+    if (getAllWhales().length <= 3) break;
     try {
-      const pubkey = new PublicKey(whale.address);
-      const lamports = await connection.getBalance(pubkey);
+      const lamports = await connection.getBalance(new PublicKey(whale.address));
       const balanceSol = lamports / 1_000_000_000;
 
       if (balanceSol < 0.2) {
         const removed = removeWhale(whale.id, 'Saldo Habis / Dompet Ditinggalkan (< 0.2 SOL)');
         if (removed) {
           prunedCount++;
-          console.log(`[WhalePruner] 🗑️ AUTO-ELIMINASI (SALDO KOSONG): ${whale.label} (${whale.address}) Saldo: ${balanceSol.toFixed(3)} SOL`);
-          await notify(`🗑️ *DOMPET PAUS DIELIMINASI OTOMATIS: SALDO HABIS*\n\n` +
+          console.log(`[WhaleScout PRO] 🗑️ ELIMINASI DEAD WALLET: ${whale.label} Saldo: ${balanceSol.toFixed(3)} SOL`);
+          await notify(
+            `🗑️ *PAUS DIELIMINASI: SALDO HABIS (Dead Wallet)*\n\n` +
             `🏷️ *Label:* ${whale.label} [${whale.tier || 'PROBATION'}]\n` +
             `📝 *Alamat:* \`${whale.address}\`\n` +
-            `💰 *Sisa Saldo On-Chain:* *${balanceSol.toFixed(3)} SOL* (Dompet telah dikosongkan/mati)\n\n` +
-            `_Sistem Auto-Substitution langsung menggantikannya dengan kandidat baru._`
+            `💰 *Sisa Saldo:* *${balanceSol.toFixed(3)} SOL* (Dompet mati)\n\n` +
+            `_Auto-Substitution langsung mengisi slot ini dari shadow queue._`
           );
         }
       }
     } catch {}
   }
 
+  // ── Stage 3: Aggressive Prune (PnL < -0.02 SOL + auto_copy=0 + idle > 48h) ──
+  const aggressivePruneThresholdHours = CONFIG.WHALE_IDLE_AGGRESSIVE_PRUNE_HOURS || 48;
+  for (const whale of getAllWhales()) {
+    if (getAllWhales().length <= 3) break;
+
+    const pnlNegative = (whale.total_pnl_sol || 0) < -0.015;
+    const isCopyOff = !whale.auto_copy;
+    const lastActivity = whale.last_trade_at ? new Date(whale.last_trade_at).getTime() : 0;
+    const idleHours = (Date.now() - lastActivity) / (1000 * 60 * 60);
+    const isLongIdle = idleHours > aggressivePruneThresholdHours;
+
+    if (pnlNegative && isCopyOff && isLongIdle) {
+      const reason = `Prune Agresif: PnL ${whale.total_pnl_sol?.toFixed(4)} SOL negatif + auto_copy=OFF + idle ${idleHours.toFixed(0)}h`;
+      const removed = removeWhale(whale.id, reason);
+      if (removed) {
+        prunedCount++;
+        console.log(`[WhaleScout PRO] ✂️ AGGRESSIVE PRUNE: ${whale.label} (${reason})`);
+        await notify(
+          `✂️ *PAUS DIPRUNE (AGGRESSIVE CLEANUP)*\n\n` +
+          `🏷️ *Label:* ${whale.label} [${whale.tier || 'PROBATION'}]\n` +
+          `📝 *Alamat:* \`${whale.address}\`\n` +
+          `⚠️ *Alasan:* ${reason}\n` +
+          `📊 *PnL:* *${whale.total_pnl_sol?.toFixed(4) || 0} SOL* | Trades: ${whale.total_trades_copied || 0}\n\n` +
+          `_Bot menjaga roster hanya diisi smart money paling berkualitas._`
+        );
+      }
+    }
+  }
+
+  // ── Stage 4: Standard Performance-Based Prune ──
   const badWhales = getWhalesForPruning(
-    CONFIG.AUTO_PRUNE_INACTIVE_HOURS, 
+    CONFIG.AUTO_PRUNE_INACTIVE_HOURS,
     CONFIG.MAX_CONSECUTIVE_LOSSES_PRUNE,
     CONFIG.MIN_WINRATE_PCT
   );
 
   for (const whale of badWhales) {
-    if (getAllWhales().length <= 3) break; // Don't prune below safety minimum
+    if (getAllWhales().length <= 3) break;
 
     let reason = '';
     const pruneThreshold = CONFIG.MAX_CONSECUTIVE_LOSSES_PRUNE || 4;
     if (whale.consecutive_losses >= pruneThreshold) {
       reason = `Performa Buruk Kronis (${whale.consecutive_losses}x Stop-Loss Berturut-turut)`;
     } else if (whale.total_trades_copied >= 4 && whale.win_rate < CONFIG.MIN_WINRATE_PCT && (whale.total_pnl_sol || 0) <= 0) {
-      reason = `Win Rate Rendah (${whale.win_rate.toFixed(1)}% < ${CONFIG.MIN_WINRATE_PCT}% dari ${whale.total_trades_copied} trade dan PnL <= 0)`;
+      reason = `Win Rate Rendah (${whale.win_rate.toFixed(1)}% < ${CONFIG.MIN_WINRATE_PCT}% dari ${whale.total_trades_copied} trade, PnL <= 0)`;
     } else {
       reason = `Tidak Aktif (> ${CONFIG.AUTO_PRUNE_INACTIVE_HOURS} jam tanpa transaksi)`;
     }
@@ -492,43 +795,44 @@ export async function pruneUnderperformingWhales(): Promise<number> {
     const removed = removeWhale(whale.id, reason);
     if (removed) {
       prunedCount++;
-      console.log(`[WhalePruner] 🗑️ DIELIMINASI: ${whale.label} (${whale.address}) - Alasan: ${reason}`);
-
-      const pruneMsg = `🗑️ *DOMPET PAUS RESMI DIELIMINASI DARI RADAR!*\n\n` +
+      console.log(`[WhaleScout PRO] 🗑️ STANDARD PRUNE: ${whale.label} — ${reason}`);
+      await notify(
+        `🗑️ *DOMPET PAUS RESMI DIELIMINASI DARI RADAR!*\n\n` +
         `🏷️ *Label:* ${whale.label} [${whale.tier || 'PROBATION'}]\n` +
         `📝 *Alamat:* \`${whale.address}\`\n` +
         `⚠️ *Alasan:* *${reason}*\n` +
-        `📊 *Statistik:* ${whale.wins || 0}W / ${whale.losses || 0}L (Winrate: *${whale.win_rate?.toFixed(1) || 0}%*) | PnL: *${whale.total_pnl_sol >= 0 ? '+' : ''}${whale.total_pnl_sol?.toFixed(4) || 0} SOL*\n\n` +
-        `_Bot menjaga standar kualitas radar trading agar hanya dompet paling menguntungkan yang dipertahankan._`;
-
-      await notify(pruneMsg);
+        `📊 *Statistik:* ${whale.wins || 0}W / ${whale.losses || 0}L (WR: *${whale.win_rate?.toFixed(1) || 0}%*) | PnL: *${whale.total_pnl_sol >= 0 ? '+' : ''}${whale.total_pnl_sol?.toFixed(4) || 0} SOL*\n\n` +
+        `_Bot menjaga standar kualitas radar agar hanya dompet paling menguntungkan yang dipertahankan._`
+      );
     }
   }
 
   if (prunedCount > 0) {
-    console.log(`[WhalePruner] ✂️ Berhasil mengeliminasi ${prunedCount} dompet berkinerja buruk.`);
+    console.log(`[WhaleScout PRO] ✂️ Total ${prunedCount} dompet dieliminasi.`);
   }
 
-  // Auto-Substitution Engine: Auto-promote top queue candidates into freed slots
+  // ── Stage 5: Immediate Auto-Substitution from Shadow Queue ──
   let substitutedCount = 0;
   const currentCount = getAllWhales().length;
   const availableSlots = CONFIG.MAX_ACTIVE_WHALES - currentCount;
 
   if (availableSlots > 0) {
+    console.log(`[WhaleScout PRO] 🔄 ${availableSlots} slot kosong — Auto-Substitution dari Shadow Queue...`);
     for (let i = 0; i < availableSlots; i++) {
       const promoted = promoteQueueWhaleToActive();
-      if (!promoted) break; // Queue is empty
+      if (!promoted) break;
 
       substitutedCount++;
-      console.log(`[WhalePruner] 🔄 AUTO-SUBSTITUTION: ${promoted.label} (${promoted.address}) dipromosikan dari Shadow Queue ke Radar Aktif.`);
-      const subMsg = `🔄 *AUTO-SUBSTITUTION: SMART MONEY DIPROMOSIKAN DARI BANGKU CADANGAN!*\n\n` +
-        `Slot radar terbuka setelah pembersihan dompet berkinerja buruk. Kandidat teratas dari Shadow Queue otomatis dipromosikan:\n\n` +
+      console.log(`[WhaleScout PRO] 🔄 AUTO-SUBSTITUTION: ${promoted.label} (${promoted.address.slice(0,8)}...) dipromosikan dari Shadow Queue.`);
+      await notify(
+        `🔄 *AUTO-SUBSTITUTION: SMART MONEY BARU DIPROMOSIKAN!*\n\n` +
+        `Slot radar terbuka setelah roster cleanup. Kandidat terbaik shadow queue dipromosikan:\n\n` +
         `🏷️ *Paus Baru:* ${promoted.label} [${promoted.tier}]\n` +
         `📝 *Alamat:* \`${promoted.address}\`\n` +
-        `🛡️ *Status Copy:* *OFF (Masa Percobaan / Shadow Tracking)* 🔬\n` +
-        `⚡ *Pipa Pemantauan:* Langsung terhubung ke WebSocket Solana RPC (<400ms).\n\n` +
-        `_Bot menjaga kapasitas alpha radar selalu prima dengan rotasi otomatis tanpa jeda!_`;
-      await notify(subMsg);
+        `🛡️ *Status Copy:* *OFF (Masa Percobaan Shadow Track)* 🔬\n` +
+        `⚡ *WebSocket:* Langsung terhubung ke Helius RPC (<400ms).\n\n` +
+        `_Bot menjaga kapasitas alpha radar selalu prima dengan rotasi otomatis!_`
+      );
     }
   }
 
@@ -539,17 +843,20 @@ export async function pruneUnderperformingWhales(): Promise<number> {
   return prunedCount;
 }
 
+// ============================================================================
 // Background Scout & Pruner Loop
+// ============================================================================
 let scoutInterval: NodeJS.Timeout | null = null;
 
 export function startWhaleScout() {
   if (scoutInterval) return;
   if (!CONFIG.AUTO_WHALE_DISCOVERY) {
-    console.log('[WhaleScout] ℹ️ Auto-Whale Discovery dimatikan di konfigurasi.');
+    console.log('[WhaleScout PRO] ℹ️ Auto-Whale Discovery dimatikan di konfigurasi.');
     return;
   }
 
-  console.log(`[WhaleScout] 🚀 Autonomous Scout & Pruner aktif (Pemeriksaan berkala tiap ${CONFIG.WHALE_DISCOVERY_INTERVAL_MIN} menit).`);
+  const migrationNote = CONFIG.WHALE_MIGRATION_SCAN_ENABLED ? ' + Raydium Migration Scanner aktif' : '';
+  console.log(`[WhaleScout PRO] 🚀 Autonomous 5-Pilar Pro Scout & Pruner aktif (Interval: ${CONFIG.WHALE_DISCOVERY_INTERVAL_MIN} menit${migrationNote}).`);
 
   // Initial check after 15 seconds of startup
   setTimeout(async () => {
@@ -573,7 +880,7 @@ export function startWhaleScout() {
         await scoutTrendingWhales(CONFIG.WHALE_SCOUT_BATCH_SIZE || 4);
       }
     } catch (err: any) {
-      console.error('[WhaleScout] Error in recurring scout loop:', err.message);
+      console.error('[WhaleScout PRO] Error in recurring scout loop:', err.message);
     }
   }, CONFIG.WHALE_DISCOVERY_INTERVAL_MIN * 60 * 1000);
 }

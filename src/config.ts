@@ -55,6 +55,13 @@ export const CONFIG = {
   MAX_CONSECUTIVE_LOSSES_PRUNE: Number(process.env.MAX_CONSECUTIVE_LOSSES_PRUNE) || 4, // Hard Cut: Permanently eliminated from DB
   MIN_WINRATE_PCT: Number(process.env.MIN_WINRATE_PCT) || 40.0, // Fired if winrate < 40% after >= 4 trades
 
+  // Pro Scout: Institutional-Grade Candidate Screening
+  WHALE_SCOUT_SIGNATURES_DEPTH: Number(process.env.WHALE_SCOUT_SIGNATURES_DEPTH) || 50, // Deep scan: 50 signatures per pool (vs lama 25)
+  WHALE_MIN_PRESCREEN_WINRATE: Number(process.env.WHALE_MIN_PRESCREEN_WINRATE) || 55.0, // Kandidat HARUS punya Win Rate >= 55% di 10 tx terakhir
+  WHALE_MIGRATION_SCAN_ENABLED: process.env.WHALE_MIGRATION_SCAN_ENABLED !== 'false', // Scan Pump.fun -> Raydium migrasi baru
+  WHALE_MIGRATION_MAX_AGE_MIN: Number(process.env.WHALE_MIGRATION_MAX_AGE_MIN) || 45, // Max 45 menit sejak pool live di Raydium
+  WHALE_IDLE_AGGRESSIVE_PRUNE_HOURS: Number(process.env.WHALE_IDLE_AGGRESSIVE_PRUNE_HOURS) || 48, // Prune agresif: paus rugi+idle > 48 jam
+
   // Anti-Rug Filter Criteria
   MIN_RUGCHECK_SCORE: Number(process.env.MIN_RUGCHECK_SCORE) || 75,
   REQUIRE_MINT_REVOKED: process.env.REQUIRE_MINT_REVOKED !== 'false',
