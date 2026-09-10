@@ -362,13 +362,16 @@ export async function assessWhaleCandidateWinRate(
     const winRate = cached.win_rate;
     const totalTrades = cached.total_trades || 0;
     const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 55.0;
-    const passed = totalTrades < 5 || winRate >= minWinRate;
+    const hasEnoughSamples = totalTrades >= 4;
+    const passed = hasEnoughSamples && winRate >= minWinRate;
     return {
       winRate,
       avgHoldSec: 9999,
       totalTrades,
       passed,
-      reason: `[Cache] Win Rate ${winRate.toFixed(1)}% (${passed ? '>=' : '<'} ${minWinRate}%)`
+      reason: hasEnoughSamples
+        ? `[Cache] Win Rate ${winRate.toFixed(1)}% (${passed ? '>=' : '<'} ${minWinRate}%) dari ${totalTrades} trade`
+        : `[Cache] Sampel trade tidak cukup (${totalTrades} swap < 4). Belum terbukti smart money.`
     };
   }
 
@@ -377,11 +380,6 @@ export async function assessWhaleCandidateWinRate(
     const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${heliusApiKey}&limit=20&type=SWAP`;
     const res = await axios.get(url, { timeout: 8000 });
     const txs: any[] = res.data || [];
-
-    if (txs.length < 5) {
-      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: 100, total_trades: txs.length });
-      return { winRate: 100, avgHoldSec: 9999, totalTrades: txs.length, passed: true, reason: 'Riwayat SWAP tidak cukup (< 5), dianggap bersih' };
-    }
 
     // Analyze token events: track SOL spent vs. SOL received per swap
     let wins = 0;
@@ -410,9 +408,18 @@ export async function assessWhaleCandidateWinRate(
     }
 
     const totalTrades = wins + losses;
-    if (totalTrades < 3) {
-      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: 100, total_trades: totalTrades });
-      return { winRate: 100, avgHoldSec: 9999, totalTrades, passed: true, reason: 'Tidak cukup data swap SOL terukur, dianggap bersih' };
+
+    // Minimum 4 trades required: A wallet with < 4 trades has no statistical track record
+    if (totalTrades < 4) {
+      const initialWr = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
+      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: initialWr, total_trades: totalTrades });
+      return {
+        winRate: initialWr,
+        avgHoldSec: 9999,
+        totalTrades,
+        passed: false,
+        reason: `Sampel trade tidak cukup (${totalTrades} swap < 4). Wallet baru/sedikit riwayat belum terbukti sebagai smart money.`
+      };
     }
 
     const winRate = (wins / totalTrades) * 100;
@@ -443,8 +450,8 @@ export async function assessWhaleCandidateWinRate(
 
     return { winRate, avgHoldSec, totalTrades, passed, reason };
   } catch (err: any) {
-    // If Helius API call fails, skip pre-screen (don't block candidate)
-    console.warn(`[WhaleScout PRO] Win rate pre-screen gagal untuk ${walletAddress.slice(0, 8)}: ${err.message} — dilanjutkan tanpa filter`);
+    // If Helius API call fails, do not assume 100% win rate or pass blindly
+    console.warn(`[WhaleScout PRO] Win rate pre-screen gagal untuk ${walletAddress.slice(0, 8)}: ${err.message}`);
     return null;
   }
 }
@@ -864,18 +871,23 @@ export async function scoutTrendingWhales(limitToRecruit: number = CONFIG.WHALE_
           }
 
           // ── Gate 6: Historical win rate pre-screen (Helius with SQLite Cache) ──
-          let winRate = 60; // default assumption if Helius unavailable
+          let winRate = 0;
           let totalTrades = 0;
           if (heliusApiKey) {
             const wr = await assessWhaleCandidateWinRate(feePayerKey, heliusApiKey);
             if (wr !== null) {
-              if (!wr.passed && wr.totalTrades >= 5) {
+              if (!wr.passed) {
                 updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
-                console.log(`[WhaleScout PRO] 📉 WR FAIL: ${feePayerKey.slice(0, 8)} — ${wr.reason}`);
+                console.log(`[WhaleScout PRO] 📉 WR FAIL / INSUFFICIENT TRADES: ${feePayerKey.slice(0, 8)} — ${wr.reason}`);
                 continue;
               }
               winRate = wr.winRate;
               totalTrades = wr.totalTrades;
+            } else {
+              // If Helius verification fails, reject to prevent unverified wallets entering roster
+              updateEarlyEntryStatus(sigInfo.signature, 'REJECTED');
+              console.log(`[WhaleScout PRO] ⚠️ UNVERIFIED: ${feePayerKey.slice(0, 8)} — Gagal verifikasi riwayat swap.`);
+              continue;
             }
           }
 
