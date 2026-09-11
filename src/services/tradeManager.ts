@@ -280,6 +280,21 @@ export async function executeBuyToken(
     return { success: false, message: 'Market Cap di bawah standar minimum' };
   }
 
+  // Institutional Risk Control 2c: Whale Buy Conviction Floor (Anti-Dust & Bait Filter)
+  if (isCopyTrade && whaleSolAmount !== undefined && whaleSolAmount > 0 && whaleSolAmount < CONFIG.MIN_WHALE_SOL_AMOUNT) {
+    console.log(`[AutoTrade] 🛡️ Ditolak: Modal beli paus hanya ${whaleSolAmount.toFixed(3)} SOL < ${CONFIG.MIN_WHALE_SOL_AMOUNT} SOL (${marketData.symbol})`);
+    if (shouldNotifyFilterSkip) {
+      const alertMsg = `⚠️ *ORDER DIBATALKAN: CONVICTION PAUS TERLALU RENDAH*\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
+        `🔍 *Modal Beli Paus:* *${whaleSolAmount.toFixed(3)} SOL* (Syarat Min: *${CONFIG.MIN_WHALE_SOL_AMOUNT} SOL*)\n\n` +
+        `_Bot hedge fund menolak order bernilai mikro untuk menghindari jebakan transaksi pancingan (bait), dust transfer, atau tes likuiditas paus yang tidak serius._`;
+      await notify(alertMsg);
+    }
+    return { success: false, message: `Volume beli paus (${whaleSolAmount.toFixed(3)} SOL) di bawah standar minimum (${CONFIG.MIN_WHALE_SOL_AMOUNT} SOL)` };
+  }
+
   // Institutional Risk Control 3: Anti-Chase / Price Drift Guard (Pucuk Guard)
   if (isPlausibleUnitPrice && whaleEntryPriceUsd && whaleEntryPriceUsd > 0) {
     const driftPct = ((marketData.priceUsd - whaleEntryPriceUsd) / whaleEntryPriceUsd) * 100;
@@ -313,6 +328,30 @@ export async function executeBuyToken(
     }
     return { success: false, message: 'Candle 5 menit terlalu overextended' };
   }
+
+  // Institutional Risk Control 4b: Anti-Late-Chaser 1-Hour Pre-Pump Surge Guard
+  // Only triggers if 1h is extreme exhaustion (>80%) OR if 1h > 40% AND 5m is already overextended (>15%)
+  const is1hExhaustion = Boolean(
+    marketData.priceChange1h && (
+      marketData.priceChange1h > 80.0 || 
+      (marketData.priceChange1h > 40.0 && (marketData.priceChange5m || 0) > 15.0)
+    )
+  );
+  if (is1hExhaustion) {
+    console.log(`[AutoTrade] 🛡️ Anti-Late-Chaser triggered: 1h pump +${marketData.priceChange1h?.toFixed(1)}% (${marketData.symbol})`);
+    if (shouldNotifyFilterSkip) {
+      const alertMsg = `⚠️ *ORDER DIBATALKAN: ANTI-LATE-CHASER GUARD*\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        whaleInfoSection +
+        `⚡ *Kenaikan 1 Jam Terakhir:* *+${marketData.priceChange1h?.toFixed(1)}%*\n` +
+        `📊 *Candle 5 Menit:* *+${(marketData.priceChange5m || 0).toFixed(1)}%*\n\n` +
+        `_Bot mendeteksi lonjakan vertikal overextended yang rawan aksi dump instan dev/pembeli awal._`;
+      await notify(alertMsg);
+    }
+    return { success: false, message: `Token mengalami lonjakan vertikal overextended dalam 1 jam (+${marketData.priceChange1h?.toFixed(1)}%)` };
+  }
+
 
   // 2. Anti-Rug Safety Audit (Result from concurrent Promise.all)
   if (!safety.isSafe) {
@@ -617,7 +656,7 @@ export async function executeSellToken(
   return { success: true, message: `Posisi ${pos.token_symbol} berhasil ditutup.` };
 }
 
-// 2.5 EXECUTE WHALE SELL FOLLOW (DUMP SYNCHRONIZATION)
+// 2.5 EXECUTE WHALE SELL FOLLOW (INSTITUTIONAL DUMP & ANTI-BOTTOM-DUMP PROTECTION)
 export async function executeWhaleSellFollow(
   whale: Whale,
   tokenMint: string,
@@ -632,13 +671,58 @@ export async function executeWhaleSellFollow(
     return { success: false, message: 'Tidak ada posisi terbuka untuk token ini.' };
   }
 
-  console.log(`[TradeManager] 🚨 WHALE SELL DETECTED! Paus ${whale.label} mendump token ${pos.token_symbol}. Melikuidasi posisi instan...`);
+  // 1. Source Origin Check: Ensure this whale actually opened this position
+  if (CONFIG.REQUIRE_WHALE_SOURCE_MATCH && pos.whale_source && pos.whale_source !== 'MANUAL' && pos.whale_source !== 'MANUAL_SNIPER') {
+    const cleanSource = pos.whale_source.toLowerCase();
+    const cleanLabel = whale.label.toLowerCase();
+    const cleanAddr = whale.address.toLowerCase();
+    const isMatching = cleanSource.includes(cleanLabel) || cleanLabel.includes(cleanSource) || cleanSource.includes(cleanAddr) || whale.tier === 'VIP';
+    if (!isMatching) {
+      console.log(`[TradeManager] ℹ️ Whale ${whale.label} dump token ${pos.token_symbol}, tapi posisi ini dibuka oleh [${pos.whale_source}]. Mengabaikan sinyal sell asing.`);
+      return { success: false, message: `Bukan paus inisiator posisi (${pos.whale_source})` };
+    }
+  }
 
-  const exitAlert = `🚨 *WHALE DUMP DETECTED — EMERGENCY SELL FOLLOW!* 🚨\n\n` +
+  // 2. Fetch Fresh Pool Liquidity & Market Reality
+  let currentLiquidity = lastKnownLiquidity.get(pos.id) || 0;
+  try {
+    const marketData = await getTokenMarketData(tokenMint, true);
+    if (marketData && marketData.liquidityUsd > 0) {
+      currentLiquidity = marketData.liquidityUsd;
+      lastKnownLiquidity.set(pos.id, currentLiquidity);
+    }
+  } catch {}
+
+  // 3. P0 Anti-Bottom-Dump Protection: Never dump blindly into thin liquidity pools (< $50k)
+  if (currentLiquidity > 0 && currentLiquidity < CONFIG.MIN_DUMP_FOLLOW_LIQUIDITY_USD) {
+    console.log(`[TradeManager] 🛡️ ANTI-BOTTOM-DUMP TRIGGERED: Likuiditas $${currentLiquidity.toFixed(0)} < $${CONFIG.MIN_DUMP_FOLLOW_LIQUIDITY_USD} (${pos.token_symbol}). Menolak dump ke wick bawah!`);
+
+    const alertMsg = `🛡️ *ANTI-BOTTOM-DUMP GUARD DIAKTIFKAN!* 🛡️\n\n` +
+      `🐋 *Paus:* *${whale.label}* (\`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`)\n` +
+      `🪙 *Token:* *${pos.token_symbol}*\n` +
+      `💧 *Likuiditas Pool:* *$${formatNumber(currentLiquidity)}* (Ambang Aman: *$${formatNumber(CONFIG.MIN_DUMP_FOLLOW_LIQUIDITY_USD)}*)\n\n` +
+      `⚠️ *Kebijakan Hedge Fund:* Bot *MENOLAK* market dump buta ke jarum wick bawah yang rawan slippage raksasa (15-35%).\n` +
+      `🔒 *Pengawalan Posisi:* Posisi tetap dikawal ketat oleh *Hard Stop-Loss (-${pos.target_sl_pct || CONFIG.STOP_LOSS_PCT}%)* dan *Moonbag Trailing Stop* secara real-time via WebSocket untuk memanen rebound harga (mean reversion) atau keluar tertib.`;
+    await notify(alertMsg);
+
+    return { success: false, message: `Likuiditas pool tipis ($${currentLiquidity.toFixed(0)}). Menolak sell di bottom wick.` };
+  }
+
+  // 4. Free-Roll Moonbag Protection: If position is already half-closed (in free-roll mode), let trailing stop manage it
+  if (pos.is_half_closed === 1 && pos.pnl_pct > 0) {
+    console.log(`[TradeManager] 🌕 MOONBAG SHIELD: Posisi ${pos.token_symbol} berstatus Free-Roll Moonbag (PnL +${pos.pnl_pct.toFixed(1)}%). Menyerahkan eksekusi ke Trailing Stop.`);
+    return { success: false, message: 'Posisi dikawal Trailing Stop Moonbag' };
+  }
+
+  // 5. Orderly Execution in Deep Pools (>= $50k)
+  console.log(`[TradeManager] 🚨 WHALE SELL FOLLOW VALID: Paus inisiator ${whale.label} keluar dari ${pos.token_symbol} di pool yang cukup dalam ($${currentLiquidity.toFixed(0)}). Melikuidasi tertib...`);
+
+  const exitAlert = `🚨 *WHALE DUMP DETECTED — ORDERLY SELL FOLLOW!* 🚨\n\n` +
     `🐋 *Paus:* *${whale.label}* (\`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`)\n` +
     `🪙 *Token:* *${pos.token_symbol}*\n` +
+    `💧 *Likuiditas Pool:* *$${formatNumber(currentLiquidity)}* (Pool Cukup Dalam ✅)\n` +
     `⚡ *Aksi Paus:* Terdeteksi swap SELL di DEX!\n\n` +
-    `🛡️ *Respons Instan:* Bot mengeksekusi likuidasi 100% seketika untuk mengamankan modal sebelum liquidity pool terkuras habis!`;
+    `🛡️ *Respons Institusional:* Bot mengeksekusi likuidasi 100% untuk mengunci profit/mengamankan modal sebelum pergerakan berlanjut.`;
   await notify(exitAlert);
 
   return await executeSellToken(pos.id, 100, `WHALE_DUMP_FOLLOW (${whale.label})`);

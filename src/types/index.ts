@@ -79,6 +79,8 @@ export interface TokenMarketData {
   url: string;
   priceChange24h: number;
   priceChange5m?: number;
+  priceChange1h?: number;
+  priceChange6h?: number;
   volume24h?: number;
 }
 

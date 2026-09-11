@@ -27,10 +27,15 @@ export const CONFIG = {
 
   // Institutional Portfolio & Execution Controls
   COPY_SELL_ENABLED: process.env.COPY_SELL_ENABLED !== 'false', // Auto-dump when whale dumps
+  MIN_DUMP_FOLLOW_LIQUIDITY_USD: Number(process.env.MIN_DUMP_FOLLOW_LIQUIDITY_USD) || 50000.0, // Anti-Bottom-Dump: Min $50k pool liquidity to copy-sell
+  REQUIRE_WHALE_SOURCE_MATCH: process.env.REQUIRE_WHALE_SOURCE_MATCH !== 'false', // Only follow dump if seller matches opening whale
   CIRCUIT_BREAKER_ENABLED: process.env.CIRCUIT_BREAKER_ENABLED === 'true', // Dinonaktifkan sementara per instruksi user (tanpa batasan jam cooldown)
   CIRCUIT_BREAKER_MAX_DAILY_LOSSES: Number(process.env.CIRCUIT_BREAKER_MAX_DAILY_LOSSES) || 999, // Tanpa batasan limit stop-loss
   CIRCUIT_BREAKER_COOLDOWN_HOURS: Number(process.env.CIRCUIT_BREAKER_COOLDOWN_HOURS) || 0, // 0 jam cooldown
   MAX_PRICE_DRIFT_PCT: Number(process.env.MAX_PRICE_DRIFT_PCT) || 6.0, // Anti-Chase / Pucuk Guard: cancel if price moved > 6%
+  MAX_1H_PRICE_CHANGE_PCT: Number(process.env.MAX_1H_PRICE_CHANGE_PCT) || 35.0, // Anti-Late-Chaser: reject if 1h pump > 35% before whale entry
+  MAX_24H_PRICE_CHANGE_PCT: Number(process.env.MAX_24H_PRICE_CHANGE_PCT) || 120.0, // Parabolic Overextension: reject if 24h pump > 120%
+  MIN_WHALE_SOL_AMOUNT: Number(process.env.MIN_WHALE_SOL_AMOUNT) || 0.20, // Min 0.2 SOL whale conviction to copy-trade (anti-dust/bait)
   MIN_LIQUIDITY_USD: Number(process.env.MIN_LIQUIDITY_USD) || 30000.0, // Min $30k pool liquidity floor (Anti-Slippage)
   MIN_VOLUME_24H_USD: Number(process.env.MIN_VOLUME_24H_USD) || 150000.0, // Min $150k 24h volume floor (Active Market)
   MIN_MARKET_CAP_USD: Number(process.env.MIN_MARKET_CAP_USD) || 15000.0, // Min $15k market cap

@@ -95,6 +95,8 @@ export async function getTokenMarketData(tokenAddress: string, forceFresh: boole
         url: bestPair.url || `https://dexscreener.com/solana/${tokenAddress}`,
         priceChange24h: bestPair.priceChange?.h24 || 0,
         priceChange5m: bestPair.priceChange?.m5 || 0,
+        priceChange1h: bestPair.priceChange?.h1 || 0,
+        priceChange6h: bestPair.priceChange?.h6 || 0,
         volume24h: bestPair.volume?.h24 || 0,
       };
 
