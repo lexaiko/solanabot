@@ -355,35 +355,54 @@ export async function detectWalletCluster(walletAddresses: string[]): Promise<{
 export async function assessWhaleCandidateWinRate(
   walletAddress: string,
   heliusApiKey: string
-): Promise<{ winRate: number; avgHoldSec: number; totalTrades: number; passed: boolean; reason: string } | null> {
+): Promise<{ winRate: number; avgHoldSec: number; totalTrades: number; netSol?: number; passed: boolean; reason: string } | null> {
+  const minSwaps = (CONFIG as any).WHALE_MIN_PRESCREEN_SWAPS || 10;
+  const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 45.0;
+
   // ── Check SQLite Cache First (Zero Helius RPC if already analyzed) ──
   const cached = getWalletIntelligence(walletAddress);
   if (cached && cached.win_rate !== undefined && cached.win_rate !== null) {
     const winRate = cached.win_rate;
     const totalTrades = cached.total_trades || 0;
-    const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 55.0;
-    const hasEnoughSamples = totalTrades >= 4;
-    const passed = hasEnoughSamples && winRate >= minWinRate;
+    const netSol = cached.net_sol_pnl ?? 0;
+    const hasEnoughSamples = totalTrades >= minSwaps;
+    const isWrPassed = winRate >= minWinRate;
+    const isProfitable = netSol > 0;
+    const passed = hasEnoughSamples && (isWrPassed || isProfitable);
+
+    let reason = '';
+    if (!hasEnoughSamples) {
+      reason = `[Cache] Sampel trade tidak cukup (${totalTrades} swap < ${minSwaps}). Wallet baru/sedikit riwayat belum terbukti.`;
+    } else if (isWrPassed && isProfitable) {
+      reason = `[Cache] WR ${winRate.toFixed(1)}% >= ${minWinRate}% & Profit +${netSol.toFixed(2)} SOL (${totalTrades} trade)`;
+    } else if (isWrPassed) {
+      reason = `[Cache] WR ${winRate.toFixed(1)}% >= ${minWinRate}% (${totalTrades} trade)`;
+    } else if (isProfitable) {
+      reason = `[Cache] Net Profit +${netSol.toFixed(2)} SOL walau WR ${winRate.toFixed(1)}% (${totalTrades} trade)`;
+    } else {
+      reason = `[Cache] WR ${winRate.toFixed(1)}% < ${minWinRate}% & Net SOL rugi (${netSol.toFixed(2)} SOL dari ${totalTrades} trade)`;
+    }
+
     return {
       winRate,
       avgHoldSec: 9999,
       totalTrades,
+      netSol,
       passed,
-      reason: hasEnoughSamples
-        ? `[Cache] Win Rate ${winRate.toFixed(1)}% (${passed ? '>=' : '<'} ${minWinRate}%) dari ${totalTrades} trade`
-        : `[Cache] Sampel trade tidak cukup (${totalTrades} swap < 4). Belum terbukti smart money.`
+      reason
     };
   }
 
   try {
-    // Use Helius Enhanced Transactions API for clean parsed tx data
-    const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${heliusApiKey}&limit=20&type=SWAP`;
+    // Query Helius Enhanced Transactions API for clean parsed swap data
+    const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${heliusApiKey}&limit=40&type=SWAP`;
     const res = await axios.get(url, { timeout: 8000 });
     const txs: any[] = res.data || [];
 
     // Analyze token events: track SOL spent vs. SOL received per swap
     let wins = 0;
     let losses = 0;
+    let totalNetSol = 0;
     let holdTimeSamples: number[] = [];
 
     for (const tx of txs) {
@@ -397,7 +416,7 @@ export async function assessWhaleCandidateWinRate(
         return sum;
       }, 0) ?? 0;
 
-      // A net positive SOL means they sold for profit, negative means they bought
+      totalNetSol += nativeDiff / 1e9;
       if (nativeDiff > 0) {
         wins++;
       } else if (nativeDiff < -0.001 * 1e9) {
@@ -409,16 +428,22 @@ export async function assessWhaleCandidateWinRate(
 
     const totalTrades = wins + losses;
 
-    // Minimum 4 trades required: A wallet with < 4 trades has no statistical track record
-    if (totalTrades < 4) {
+    // Minimum 10 trades required: A wallet with < 10 trades has no verified statistical track record
+    if (totalTrades < minSwaps) {
       const initialWr = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
-      saveWalletIntelligence({ wallet_address: walletAddress, win_rate: initialWr, total_trades: totalTrades });
+      saveWalletIntelligence({
+        wallet_address: walletAddress,
+        win_rate: initialWr,
+        total_trades: totalTrades,
+        net_sol_pnl: totalNetSol
+      });
       return {
         winRate: initialWr,
         avgHoldSec: 9999,
         totalTrades,
+        netSol: totalNetSol,
         passed: false,
-        reason: `Sampel trade tidak cukup (${totalTrades} swap < 4). Wallet baru/sedikit riwayat belum terbukti sebagai smart money.`
+        reason: `Sampel trade tidak cukup (${totalTrades} swap < ${minSwaps}). Wallet baru/sedikit riwayat belum terbukti smart money.`
       };
     }
 
@@ -435,22 +460,31 @@ export async function assessWhaleCandidateWinRate(
       avgHoldSec = totalHold / (holdTimeSamples.length - 1);
     }
 
-    const minWinRate = CONFIG.WHALE_MIN_PRESCREEN_WINRATE || 55.0;
-    const passed = winRate >= minWinRate;
-    const reason = passed
-      ? `Win Rate ${winRate.toFixed(1)}% >= ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`
-      : `Win Rate ${winRate.toFixed(1)}% < ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`;
+    const isWrPassed = winRate >= minWinRate;
+    const isProfitable = totalNetSol > 0;
+    const passed = isWrPassed || isProfitable;
+
+    let reason = '';
+    if (isWrPassed && isProfitable) {
+      reason = `WR ${winRate.toFixed(1)}% >= ${minWinRate}% & Profit +${totalNetSol.toFixed(2)} SOL (${wins}W/${losses}L dari ${totalTrades} trade)`;
+    } else if (isWrPassed) {
+      reason = `WR ${winRate.toFixed(1)}% >= ${minWinRate}% (${wins}W/${losses}L dari ${totalTrades} trade)`;
+    } else if (isProfitable) {
+      reason = `Net Profit +${totalNetSol.toFixed(2)} SOL walau WR ${winRate.toFixed(1)}% (${wins}W/${losses}L dari ${totalTrades} trade)`;
+    } else {
+      reason = `WR ${winRate.toFixed(1)}% < ${minWinRate}% & Net SOL rugi (${totalNetSol.toFixed(2)} SOL) dari ${totalTrades} trade`;
+    }
 
     // Persist to intelligence cache
     saveWalletIntelligence({
       wallet_address: walletAddress,
       win_rate: winRate,
-      total_trades: totalTrades
+      total_trades: totalTrades,
+      net_sol_pnl: totalNetSol
     });
 
-    return { winRate, avgHoldSec, totalTrades, passed, reason };
+    return { winRate, avgHoldSec, totalTrades, netSol: totalNetSol, passed, reason };
   } catch (err: any) {
-    // If Helius API call fails, do not assume 100% win rate or pass blindly
     console.warn(`[WhaleScout PRO] Win rate pre-screen gagal untuk ${walletAddress.slice(0, 8)}: ${err.message}`);
     return null;
   }
@@ -1194,23 +1228,37 @@ export async function pruneUnderperformingWhales(): Promise<number> {
   let prunedCount = 0;
   const freshWhales = getAllWhales();
 
-  // ── Stage 2: Dead Wallet Elimination (Balance < 0.2 SOL) ──
+  // ── Stage 2: Triad Evaluation (Saldo Sekarat < 0.3 SOL ATAU [WR < 35% && Net SOL < -5.0 SOL]) ──
   for (const whale of freshWhales) {
     if (getAllWhales().length <= 3) break;
     try {
       const lamports = await connection.getBalance(new PublicKey(whale.address));
       const balanceSol = lamports / 1_000_000_000;
 
-      if (balanceSol < 0.2) {
-        const removed = removeWhale(whale.id, 'Saldo Habis / Dompet Ditinggalkan (< 0.2 SOL)');
+      const intel = getWalletIntelligence(whale.address);
+      const isBalanceDead = balanceSol < 0.30;
+      const isChronicLoser = Boolean(
+        intel && 
+        intel.total_trades && intel.total_trades >= 10 &&
+        intel.win_rate !== undefined && intel.win_rate < 35.0 && 
+        intel.net_sol_pnl !== undefined && intel.net_sol_pnl < -5.0
+      );
+
+      if (isBalanceDead || isChronicLoser) {
+        const reason = isBalanceDead 
+          ? `Saldo Sekarat (${balanceSol.toFixed(2)} SOL < 0.3 SOL). Tidak mampu trading normal.`
+          : `Performa Kronis: WR ${intel?.win_rate?.toFixed(1)}% (< 35%) & Net PnL ${intel?.net_sol_pnl?.toFixed(1)} SOL (< -5 SOL dari ${intel?.total_trades} swap)`;
+
+        const removed = removeWhale(whale.id, reason);
         if (removed) {
           prunedCount++;
-          console.log(`[WhaleScout PRO] 🗑️ ELIMINASI DEAD WALLET: ${whale.label} Saldo: ${balanceSol.toFixed(3)} SOL`);
+          console.log(`[WhaleScout PRO] 🗑️ TRIAD PRUNE: ${whale.label} — ${reason}`);
           await notify(
-            `🗑️ *PAUS DIELIMINASI: SALDO HABIS (Dead Wallet)*\n\n` +
+            `🗑️ *DOMPET PAUS DIELIMINASI (TRIAD EVALUATION)*\n\n` +
             `🏷️ *Label:* ${whale.label} [${whale.tier || 'PROBATION'}]\n` +
             `📝 *Alamat:* \`${whale.address}\`\n` +
-            `💰 *Sisa Saldo:* *${balanceSol.toFixed(3)} SOL* (Dompet mati)\n\n` +
+            `⚠️ *Alasan:* ${reason}\n` +
+            `💰 *Sisa Saldo:* *${balanceSol.toFixed(3)} SOL*\n\n` +
             `_Auto-Substitution langsung mengisi slot ini dari shadow queue._`
           );
         }

@@ -131,6 +131,7 @@ export interface WalletIntelligence {
   funder_checked_at?: string;
   win_rate?: number;
   total_trades?: number;
+  net_sol_pnl?: number;
   win_rate_checked_at?: string;
   first_seen_at: string;
   last_checked_at: string;

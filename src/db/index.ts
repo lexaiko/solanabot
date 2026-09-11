@@ -150,6 +150,7 @@ export function initDatabase() {
       funder_checked_at TEXT,
       win_rate REAL,
       total_trades INTEGER,
+      net_sol_pnl REAL,
       win_rate_checked_at TEXT,
       first_seen_at TEXT NOT NULL,
       last_checked_at TEXT NOT NULL,
@@ -163,6 +164,10 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_early_entry_wallet_token ON early_entry_events(wallet_address, token_mint);
     CREATE INDEX IF NOT EXISTS idx_early_outcome_event ON early_entry_outcomes(event_id);
   `);
+
+  try {
+    db.exec('ALTER TABLE wallet_intelligence ADD COLUMN net_sol_pnl REAL;');
+  } catch (_) {}
 
   // Migrations for existing DB instances
   try { db.exec('ALTER TABLE whales ADD COLUMN consecutive_losses INTEGER DEFAULT 0;'); } catch {}
@@ -1219,15 +1224,16 @@ export function saveWalletIntelligence(intel: Partial<WalletIntelligence> & { wa
       db.prepare(`
         INSERT INTO wallet_intelligence (
           wallet_address, funder_address, funder_checked_at,
-          win_rate, total_trades, win_rate_checked_at,
+          win_rate, total_trades, net_sol_pnl, win_rate_checked_at,
           first_seen_at, last_checked_at, analysis_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         intel.wallet_address,
         intel.funder_address ?? null,
         intel.funder_checked_at ?? (intel.funder_address ? now : null),
         intel.win_rate !== undefined ? intel.win_rate : null,
         intel.total_trades !== undefined ? intel.total_trades : null,
+        intel.net_sol_pnl !== undefined ? intel.net_sol_pnl : null,
         intel.win_rate_checked_at ?? (intel.win_rate !== undefined ? now : null),
         intel.first_seen_at || now,
         now,
@@ -1240,6 +1246,7 @@ export function saveWalletIntelligence(intel: Partial<WalletIntelligence> & { wa
           funder_checked_at = COALESCE(?, funder_checked_at),
           win_rate = COALESCE(?, win_rate),
           total_trades = COALESCE(?, total_trades),
+          net_sol_pnl = COALESCE(?, net_sol_pnl),
           win_rate_checked_at = COALESCE(?, win_rate_checked_at),
           last_checked_at = ?,
           analysis_status = COALESCE(?, analysis_status)
@@ -1249,6 +1256,7 @@ export function saveWalletIntelligence(intel: Partial<WalletIntelligence> & { wa
         intel.funder_checked_at ?? (intel.funder_address ? now : null),
         intel.win_rate !== undefined ? intel.win_rate : null,
         intel.total_trades !== undefined ? intel.total_trades : null,
+        intel.net_sol_pnl !== undefined ? intel.net_sol_pnl : null,
         intel.win_rate_checked_at ?? (intel.win_rate !== undefined ? now : null),
         now,
         intel.analysis_status ?? null,

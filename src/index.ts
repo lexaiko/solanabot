@@ -37,11 +37,16 @@ async function main() {
       }
 
       let whaleEntryPriceUsd: number | undefined = undefined;
-      if (tokenAmount && tokenAmount > 0 && solAmount && solAmount > 0) {
+      if (tokenAmount && tokenAmount > 1.0 && solAmount && solAmount > 0) {
         try {
           const { getSolPriceUsd } = await import('./services/dexscreener');
           const solPrice = await getSolPriceUsd();
-          whaleEntryPriceUsd = (solAmount * solPrice) / tokenAmount;
+          const totalSpendUsd = solAmount * solPrice;
+          const calculatedPrice = totalSpendUsd / tokenAmount;
+          // Guard: if calculatedPrice is within 10% of total spend, tokenAmount was essentially 1 unit
+          if (calculatedPrice < totalSpendUsd * 0.9) {
+            whaleEntryPriceUsd = calculatedPrice;
+          }
         } catch {}
       }
 

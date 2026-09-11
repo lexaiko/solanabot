@@ -20,10 +20,10 @@ export const CONFIG = {
   VIP_BUY_AMOUNT_SOL: Number(process.env.VIP_BUY_AMOUNT_SOL) || 0.075, // Tier-weighted sizing for VIP whales
   SLIPPAGE_PCT: Number(process.env.SLIPPAGE_PCT) || 2.5,
 
-  // Risk Management & Multi-Tier TP
-  TAKE_PROFIT_PCT: Number(process.env.TAKE_PROFIT_PCT) || 42.0, // Stage 1 TP: Sell 50% (Pro Asymmetric Payoff)
-  STOP_LOSS_PCT: Number(process.env.STOP_LOSS_PCT) || 14.0, // Institutional 14% max drawdown ceiling
-  TRAILING_STOP_PCT: Number(process.env.TRAILING_STOP_PCT) || 18.0, // Moonbag breathing room protection (Pro Wide Trailing)
+  // Risk Management & Multi-Tier TP (Hedge Fund Quant Asymmetry: R:R >= 3.5:1)
+  TAKE_PROFIT_PCT: Number(process.env.TAKE_PROFIT_PCT) || 45.0, // Stage 1 TP: Target +45% (Harvest initial capital & strong profit)
+  STOP_LOSS_PCT: Number(process.env.STOP_LOSS_PCT) || 9.5, // Strict Institutional 9.5% hard drawdown ceiling (room for entry spread)
+  TRAILING_STOP_PCT: Number(process.env.TRAILING_STOP_PCT) || 12.0, // Moonbag breathing room protection (Pro Wide Trailing)
 
   // Institutional Portfolio & Execution Controls
   COPY_SELL_ENABLED: process.env.COPY_SELL_ENABLED !== 'false', // Auto-dump when whale dumps
@@ -31,7 +31,7 @@ export const CONFIG = {
   CIRCUIT_BREAKER_MAX_DAILY_LOSSES: Number(process.env.CIRCUIT_BREAKER_MAX_DAILY_LOSSES) || 999, // Tanpa batasan limit stop-loss
   CIRCUIT_BREAKER_COOLDOWN_HOURS: Number(process.env.CIRCUIT_BREAKER_COOLDOWN_HOURS) || 0, // 0 jam cooldown
   MAX_PRICE_DRIFT_PCT: Number(process.env.MAX_PRICE_DRIFT_PCT) || 6.0, // Anti-Chase / Pucuk Guard: cancel if price moved > 6%
-  MIN_LIQUIDITY_USD: Number(process.env.MIN_LIQUIDITY_USD) || 25000.0, // Min $25k pool liquidity floor (Anti-Slippage)
+  MIN_LIQUIDITY_USD: Number(process.env.MIN_LIQUIDITY_USD) || 30000.0, // Min $30k pool liquidity floor (Anti-Slippage)
   MIN_VOLUME_24H_USD: Number(process.env.MIN_VOLUME_24H_USD) || 150000.0, // Min $150k 24h volume floor (Active Market)
   MIN_MARKET_CAP_USD: Number(process.env.MIN_MARKET_CAP_USD) || 15000.0, // Min $15k market cap
   MAX_OPEN_POSITIONS: Number(process.env.MAX_OPEN_POSITIONS) || 15, // Max concurrent active trades (allows up to 15 concurrent positions for backtesting & broad diversification)
@@ -57,7 +57,8 @@ export const CONFIG = {
 
   // Pro Scout: Institutional-Grade Candidate Screening
   WHALE_SCOUT_SIGNATURES_DEPTH: Number(process.env.WHALE_SCOUT_SIGNATURES_DEPTH) || 50, // Deep scan: 50 signatures per pool (vs lama 25)
-  WHALE_MIN_PRESCREEN_WINRATE: Number(process.env.WHALE_MIN_PRESCREEN_WINRATE) || 55.0, // Kandidat HARUS punya Win Rate >= 55% di 10 tx terakhir
+  WHALE_MIN_PRESCREEN_WINRATE: Number(process.env.WHALE_MIN_PRESCREEN_WINRATE) || 45.0, // Kandidat prescreen WR >= 45% (atau Net SOL Profit)
+  WHALE_MIN_PRESCREEN_SWAPS: Number(process.env.WHALE_MIN_PRESCREEN_SWAPS) || 10, // Minimal 10 swap terverifikasi (anti-burner/small sample)
   WHALE_MIGRATION_SCAN_ENABLED: process.env.WHALE_MIGRATION_SCAN_ENABLED !== 'false', // Scan Pump.fun -> Raydium migrasi baru
   WHALE_MIGRATION_MAX_AGE_MIN: Number(process.env.WHALE_MIGRATION_MAX_AGE_MIN) || 45, // Max 45 menit sejak pool live di Raydium
   WHALE_IDLE_AGGRESSIVE_PRUNE_HOURS: Number(process.env.WHALE_IDLE_AGGRESSIVE_PRUNE_HOURS) || 48, // Prune agresif: paus rugi+idle > 48 jam
